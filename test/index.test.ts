@@ -2,9 +2,10 @@ import { mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { DEFAULT_MAX_BYTES } from "@earendil-works/pi-coding-agent";
 import { afterEach, describe, expect, it } from "vitest";
 import { buildCallbackBootstrap, CallbackStream, parseCallbackFileName } from "../src/callbacks.js";
-import { createSessionJobTool, validateJobName } from "../src/jobs.js";
+import { createSessionJobTool, readLogTail, validateJobName } from "../src/jobs.js";
 
 const temporaryDirectories: string[] = [];
 
@@ -138,6 +139,39 @@ describe("callback inbox", () => {
 });
 
 describe("session_job", () => {
+	it("reads exact trailing lines with or without a final newline", async () => {
+		const directory = await createTemporaryDirectory();
+		const logPath = path.join(directory, "job.log");
+
+		await writeFile(logPath, "first\nsecond\nthird", "utf8");
+		expect(await readLogTail(logPath, 1)).toBe("third");
+		expect(await readLogTail(logPath, 2)).toBe("second\nthird");
+
+		await writeFile(logPath, "first\nsecond\nthird\n", "utf8");
+		expect(await readLogTail(logPath, 1)).toBe("third");
+		expect(await readLogTail(logPath, 2)).toBe("second\nthird");
+	});
+
+	it("returns a bounded UTF-8-safe tail with a truncation notice", async () => {
+		const directory = await createTemporaryDirectory();
+		const logPath = path.join(directory, "job.log");
+		await writeFile(logPath, `${"🙂".repeat(20_000)}\nfinal line`, "utf8");
+
+		const output = await readLogTail(logPath, 2, DEFAULT_MAX_BYTES);
+		expect(Buffer.byteLength(output)).toBeLessThanOrEqual(DEFAULT_MAX_BYTES);
+		expect(output).toContain("[Log truncated; showing the tail only]");
+		expect(output).not.toContain("�");
+		expect(output).toMatch(/final line$/);
+	});
+
+	it("returns an empty-log placeholder", async () => {
+		const directory = await createTemporaryDirectory();
+		const logPath = path.join(directory, "job.log");
+		await writeFile(logPath, "", "utf8");
+
+		expect(await readLogTail(logPath, 20)).toBe("(no output yet)");
+	});
+
 	it("validates portable explicit names", () => {
 		expect(validateJobName("tests-linux_1.0")).toBe(true);
 		expect(validateJobName("-bad")).toBe(false);

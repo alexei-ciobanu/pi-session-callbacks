@@ -7,6 +7,11 @@
 - Added compact, action-aware `session_job` call and result rendering. Job paths and timestamps are shown only in expanded output.
 - Show the submitted Bash command in `session_job start` calls.
 - Render quiet callbacks as durable TUI-only entries that never enter agent context or trigger agent turns.
+- Bound `session_job logs` results to Pi's 50KB and 2,000-line tool-output limits while preserving the complete durable log.
+
+### Fixed
+
+- Preserve UTF-8 boundaries and exact requested line counts when reading a durable log tail, including logs without a final newline.
 
 ## [0.1.0] - 2026-07-22
 
