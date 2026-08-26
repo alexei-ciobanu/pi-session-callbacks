@@ -1,8 +1,9 @@
-import { mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import { execFileSync } from "node:child_process";
+import { mkdtemp, readdir, readFile, rm, utimes, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { DEFAULT_MAX_BYTES } from "@earendil-works/pi-coding-agent";
+import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES } from "@earendil-works/pi-coding-agent";
 import { afterEach, describe, expect, it } from "vitest";
 import {
 	buildCallbackBootstrap,
@@ -173,6 +174,16 @@ describe("session_job", () => {
 		expect(output).toMatch(/final line$/);
 	});
 
+	it("omits an incomplete trailing UTF-8 sequence from a live log read", async () => {
+		const directory = await createTemporaryDirectory();
+		const logPath = path.join(directory, "job.log");
+		await writeFile(logPath, Buffer.from([0x6f, 0x6b, 0x20, 0xf0, 0x9f]));
+
+		const output = await readLogTail(logPath, 1);
+		expect(output).toBe("ok");
+		expect(output).not.toContain("�");
+	});
+
 	it("returns an empty-log placeholder", async () => {
 		const directory = await createTemporaryDirectory();
 		const logPath = path.join(directory, "job.log");
@@ -218,6 +229,281 @@ describe("session_job", () => {
 		callbacks.stop();
 	});
 
+	it("includes an opt-in log tail in status without changing metadata-only status", async () => {
+		const agentDirectory = await createTemporaryDirectory();
+		const workspace = await createTemporaryDirectory();
+		const { callbacks } = createCallbackStream();
+		const context = createContext(workspace);
+		await callbacks.start(agentDirectory, "status-tail-session", context);
+		const tool = createSessionJobTool(callbacks, agentDirectory);
+
+		await tool.execute(
+			"start-status-tail",
+			{ action: "start", name: "status-tail", command: "printf 'first\\nsecond\\nthird\\n'; sleep 30" },
+			undefined,
+			undefined,
+			context,
+		);
+		const jobDirectory = path.join(agentDirectory, "callbacks", "status-tail-session", "jobs", "status-tail");
+		await waitFor(async () => (await readFile(path.join(jobDirectory, "job.log"), "utf8")).includes("third"));
+
+		const metadataOnly = await tool.execute(
+			"status-without-tail",
+			{ action: "status", name: "status-tail" },
+			undefined,
+			undefined,
+			context,
+		);
+		expect(metadataOnly.content[0]?.type === "text" ? metadataOnly.content[0].text : "").not.toContain(
+			"Recent output",
+		);
+		expect(metadataOnly.details?.logText).toBeUndefined();
+
+		const withTail = await tool.execute(
+			"status-with-tail",
+			{ action: "status", name: "status-tail", lines: 2 },
+			undefined,
+			undefined,
+			context,
+		);
+		const text = withTail.content[0]?.type === "text" ? withTail.content[0].text : "";
+		expect(text).toContain("Recent output:\nsecond\nthird");
+		expect(withTail.details?.logText).toBe("second\nthird");
+
+		await tool.execute("stop-status-tail", { action: "stop", name: "status-tail" }, undefined, undefined, context);
+		callbacks.stop();
+	});
+
+	it("bounds UTF-8 status tails within the tool output limit", async () => {
+		const agentDirectory = await createTemporaryDirectory();
+		const workspace = await createTemporaryDirectory();
+		const { callbacks } = createCallbackStream();
+		const context = createContext(workspace);
+		await callbacks.start(agentDirectory, "status-large-tail-session", context);
+		const tool = createSessionJobTool(callbacks, agentDirectory);
+
+		const startResult = await tool.execute(
+			"start-status-large-tail",
+			{ action: "start", name: "status-large-tail", command: "sleep 30" },
+			undefined,
+			undefined,
+			context,
+		);
+		const logPath = startResult.details?.job?.logPath;
+		if (!logPath) throw new Error("job did not return a log path");
+		await writeFile(logPath, `${"🙂".repeat(20_000)}\nfinal line`, "utf8");
+
+		const statusResult = await tool.execute(
+			"status-large-tail",
+			{ action: "status", name: "status-large-tail", lines: 2 },
+			undefined,
+			undefined,
+			context,
+		);
+		const text = statusResult.content[0]?.type === "text" ? statusResult.content[0].text : "";
+		expect(Buffer.byteLength(text)).toBeLessThanOrEqual(DEFAULT_MAX_BYTES);
+		expect(text).toContain("[Log truncated; showing the tail only]");
+		expect(text).not.toContain("�");
+		expect(text).toMatch(/final line$/);
+		const expandedResult = tool.renderResult?.(
+			statusResult,
+			{ expanded: true, isPartial: false },
+			identityTheme as never,
+			{
+				cwd: workspace,
+				toolCallId: "status-large-tail-render",
+				args: { action: "status", name: "status-large-tail", lines: 2 },
+			} as never,
+		);
+		const expandedText =
+			expandedResult
+				?.render(1_000_000)
+				.map((line) => line.trimEnd())
+				.join("\n") ?? "";
+		expect(Buffer.byteLength(expandedText)).toBeLessThanOrEqual(DEFAULT_MAX_BYTES);
+
+		await writeFile(
+			logPath,
+			Array.from({ length: DEFAULT_MAX_LINES }, (_, index) => `line ${index + 1}`).join("\n"),
+			"utf8",
+		);
+		const lineBoundResult = await tool.execute(
+			"status-line-bound",
+			{ action: "status", name: "status-large-tail", lines: DEFAULT_MAX_LINES },
+			undefined,
+			undefined,
+			context,
+		);
+		const lineBoundText = lineBoundResult.content[0]?.type === "text" ? lineBoundResult.content[0].text : "";
+		expect(lineBoundText.split("\n").length).toBeLessThanOrEqual(DEFAULT_MAX_LINES);
+		expect(lineBoundText).toMatch(/line 2000$/);
+
+		await tool.execute(
+			"stop-status-large-tail",
+			{ action: "stop", name: "status-large-tail" },
+			undefined,
+			undefined,
+			context,
+		);
+		callbacks.stop();
+	});
+
+	it("does not accept a timestamped terminal observation beyond the wait deadline", async () => {
+		const agentDirectory = await createTemporaryDirectory();
+		const workspace = await createTemporaryDirectory();
+		const { callbacks } = createCallbackStream();
+		const context = createContext(workspace);
+		await callbacks.start(agentDirectory, "wait-late-terminal-session", context);
+		const tool = createSessionJobTool(callbacks, agentDirectory);
+
+		await tool.execute(
+			"start-wait-late-terminal",
+			{ action: "start", name: "wait-late-terminal", command: "true" },
+			undefined,
+			undefined,
+			context,
+		);
+		const exitCodePath = path.join(
+			agentDirectory,
+			"callbacks",
+			"wait-late-terminal-session",
+			"jobs",
+			"wait-late-terminal",
+			"exit-code",
+		);
+		await waitFor(async () => {
+			try {
+				await readFile(exitCodePath, "utf8");
+				return true;
+			} catch {
+				return false;
+			}
+		});
+		const future = new Date(Date.now() + 5_000);
+		await utimes(exitCodePath, future, future);
+
+		const waitResult = await tool.execute(
+			"wait-late-terminal",
+			{ action: "wait", name: "wait-late-terminal", timeoutSeconds: 0 },
+			undefined,
+			undefined,
+			context,
+		);
+		expect(waitResult.details?.job?.status).toBe("succeeded");
+		expect(waitResult.details?.waitTimedOut).toBe(true);
+		expect(waitResult.details?.completionAcknowledged).toBe(false);
+		callbacks.stop();
+	});
+
+	it("streams changed wait progress and returns the requested final tail", async () => {
+		const agentDirectory = await createTemporaryDirectory();
+		const workspace = await createTemporaryDirectory();
+		const { callbacks, messages } = createCallbackStream();
+		const context = createContext(workspace);
+		await callbacks.start(agentDirectory, "wait-progress-session", context);
+		const tool = createSessionJobTool(callbacks, agentDirectory);
+
+		await tool.execute(
+			"start-wait-progress",
+			{
+				action: "start",
+				name: "wait-progress",
+				command: "sleep 0.2; printf 'phase one\\n'; sleep 0.6; printf 'phase two\\n'; sleep 0.6",
+			},
+			undefined,
+			undefined,
+			context,
+		);
+		const updates: string[] = [];
+		const waitResult = await tool.execute(
+			"wait-with-progress",
+			{ action: "wait", name: "wait-progress", timeoutSeconds: 3, lines: 1 },
+			undefined,
+			(update) => {
+				const content = update.content[0];
+				if (content?.type === "text") updates.push(content.text);
+			},
+			context,
+		);
+
+		expect(updates.length).toBeGreaterThanOrEqual(2);
+		expect(updates.some((update) => update.includes("phase one"))).toBe(true);
+		expect(updates.at(-1)).toContain("phase two");
+		expect(new Set(updates).size).toBe(updates.length);
+		expect(waitResult.details?.job?.status).toBe("succeeded");
+		expect(waitResult.details?.completionAcknowledged).toBe(true);
+		expect(waitResult.details?.logText).toBe("phase two");
+		const resultText = waitResult.content[0]?.type === "text" ? waitResult.content[0].text : "";
+		expect(resultText).toContain("Recent output:\nphase two");
+		await new Promise((resolve) => setTimeout(resolve, 75));
+		expect(messages).toHaveLength(0);
+		callbacks.stop();
+	});
+
+	it("suppresses unchanged wait progress between heartbeats", async () => {
+		const agentDirectory = await createTemporaryDirectory();
+		const workspace = await createTemporaryDirectory();
+		const { callbacks } = createCallbackStream();
+		const context = createContext(workspace);
+		await callbacks.start(agentDirectory, "wait-unchanged-session", context);
+		const tool = createSessionJobTool(callbacks, agentDirectory);
+
+		await tool.execute(
+			"start-wait-unchanged",
+			{ action: "start", name: "wait-unchanged", command: "sleep 1.2" },
+			undefined,
+			undefined,
+			context,
+		);
+		const updates: unknown[] = [];
+		await tool.execute(
+			"wait-unchanged",
+			{ action: "wait", name: "wait-unchanged", timeoutSeconds: 3 },
+			undefined,
+			(update) => updates.push(update),
+			context,
+		);
+
+		expect(updates).toHaveLength(1);
+		callbacks.stop();
+	});
+
+	it.skipIf(process.platform === "win32")("does not block on a non-regular replacement log", async () => {
+		const agentDirectory = await createTemporaryDirectory();
+		const workspace = await createTemporaryDirectory();
+		const { callbacks } = createCallbackStream();
+		const context = createContext(workspace);
+		await callbacks.start(agentDirectory, "wait-fifo-session", context);
+		const tool = createSessionJobTool(callbacks, agentDirectory);
+
+		const startResult = await tool.execute(
+			"start-wait-fifo",
+			{ action: "start", name: "wait-fifo", command: "sleep 30" },
+			undefined,
+			undefined,
+			context,
+		);
+		const logPath = startResult.details?.job?.logPath;
+		if (!logPath) throw new Error("job did not return a log path");
+		await rm(logPath);
+		execFileSync("mkfifo", [logPath]);
+
+		const startedAt = Date.now();
+		const waitResult = await tool.execute(
+			"wait-fifo",
+			{ action: "wait", name: "wait-fifo", timeoutSeconds: 0.05, lines: 1 },
+			undefined,
+			undefined,
+			context,
+		);
+		expect(Date.now() - startedAt).toBeLessThan(500);
+		expect(waitResult.details?.waitTimedOut).toBe(true);
+		expect(waitResult.details?.logText).toBe("(log unavailable: not a regular file)");
+
+		await tool.execute("stop-wait-fifo", { action: "stop", name: "wait-fifo" }, undefined, undefined, context);
+		callbacks.stop();
+	});
+
 	it("delivers the normal callback after wait times out", async () => {
 		const agentDirectory = await createTemporaryDirectory();
 		const workspace = await createTemporaryDirectory();
@@ -228,14 +514,16 @@ describe("session_job", () => {
 
 		await tool.execute(
 			"start-wait-timeout",
-			{ action: "start", name: "wait-timeout", command: "sleep 0.15" },
+			{ action: "start", name: "wait-timeout", command: "printf 'still running\\n'; sleep 0.15" },
 			undefined,
 			undefined,
 			context,
 		);
+		const jobDirectory = path.join(agentDirectory, "callbacks", "wait-timeout-session", "jobs", "wait-timeout");
+		await waitFor(async () => (await readFile(path.join(jobDirectory, "job.log"), "utf8")).includes("still running"));
 		const waitResult = await tool.execute(
 			"wait-timeout",
-			{ action: "wait", name: "wait-timeout", timeoutSeconds: 0.01 },
+			{ action: "wait", name: "wait-timeout", timeoutSeconds: 0.01, lines: 1 },
 			undefined,
 			undefined,
 			context,
@@ -244,6 +532,9 @@ describe("session_job", () => {
 		expect(waitResult.details?.job?.status).toBe("running");
 		expect(waitResult.details?.waitTimedOut).toBe(true);
 		expect(waitResult.details?.completionAcknowledged).toBe(false);
+		expect(waitResult.details?.logText).toBe("still running");
+		const waitText = waitResult.content[0]?.type === "text" ? waitResult.content[0].text : "";
+		expect(waitText).toContain("Recent output:\nstill running");
 		await waitFor(() => messages.length === 1);
 		expect(messages[0]?.message.content).toBe("Job wait-timeout completed successfully.");
 		callbacks.stop();
@@ -472,17 +763,20 @@ describe("session_job", () => {
 			context,
 		);
 		const controller = new AbortController();
+		const updates: unknown[] = [];
 		const waitPromise = tool.execute(
 			"wait-cancel",
 			{ action: "wait", name: "wait-cancel", timeoutSeconds: 2 },
 			controller.signal,
-			undefined,
+			(update) => updates.push(update),
 			context,
 		);
 		setTimeout(() => controller.abort(), 25);
 
 		await expect(waitPromise).rejects.toThrow();
+		const updatesAfterCancellation = updates.length;
 		await waitFor(() => messages.length === 1);
+		expect(updates.length).toBe(updatesAfterCancellation);
 		expect(messages[0]?.message.content).toBe("Job wait-cancel completed successfully.");
 		callbacks.stop();
 	});
@@ -616,6 +910,19 @@ describe("session_job", () => {
 			{ cwd: "/workspace", toolCallId: "wait-render", args: { action: "wait", name: "training" } } as never,
 		);
 		expect(renderedText(component)).toBe("training · running · started 1m ago · pid 123 · wait timed out");
+
+		const partial = tool.renderResult?.(
+			{
+				...result,
+				details: { ...result.details, waitTimedOut: undefined, waitedMs: 6_000, logText: "epoch 2/10" },
+			},
+			{ expanded: false, isPartial: true },
+			identityTheme as never,
+			{ cwd: "/workspace", toolCallId: "wait-render", args: { action: "wait", name: "training" } } as never,
+		);
+		expect(renderedText(partial)).toBe(
+			"training · running · started 1m ago · pid 123 · waiting · waited 6s\n\nepoch 2/10",
+		);
 	});
 
 	it("renders log output without repeating job metadata when collapsed", () => {

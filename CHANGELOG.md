@@ -11,6 +11,8 @@
 - Added bounded `session_job wait` with cancellation, zero-second snapshots, and coordinated completion acknowledgement.
 - Atomically arbitrate automatic completions between the callback watcher and concurrent waiters.
 - Show relative job start age in status, wait, list, start, logs, and stop summaries.
+- Allow `status` and `wait` to include an opt-in bounded log tail through the existing `lines` parameter.
+- Render throttled live job state, wait duration, and requested log tails while `session_job wait` is active.
 
 ### Fixed
 
