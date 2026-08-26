@@ -410,7 +410,9 @@ async function waitForJob(
 			if (isTerminal(job)) {
 				const endedAt = job.endedAt ? Date.parse(job.endedAt) : Number.NaN;
 				const completedWithinDeadline =
-					firstObservation || observedAt <= deadline || (Number.isFinite(endedAt) && endedAt <= deadline);
+					observedAt <= deadline ||
+					(Number.isFinite(endedAt) && endedAt <= deadline) ||
+					(firstObservation && !Number.isFinite(endedAt));
 				if (!completedWithinDeadline) {
 					return {
 						job,
@@ -748,7 +750,8 @@ export function createSessionJobTool(callbacks: CallbackStream, agentDirectory: 
 				text = fallback;
 			}
 
-			return new Text(theme.fg("toolOutput", text), 0, 0);
+			const boundedText = truncateTail(text, { maxBytes: DEFAULT_MAX_BYTES, maxLines: DEFAULT_MAX_LINES }).content;
+			return new Text(theme.fg("toolOutput", boundedText), 0, 0);
 		},
 	});
 }

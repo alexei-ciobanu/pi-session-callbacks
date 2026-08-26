@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readdir, readFile, rm, utimes, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -305,6 +305,22 @@ describe("session_job", () => {
 		expect(text).toContain("[Log truncated; showing the tail only]");
 		expect(text).not.toContain("�");
 		expect(text).toMatch(/final line$/);
+		const expandedResult = tool.renderResult?.(
+			statusResult,
+			{ expanded: true, isPartial: false },
+			identityTheme as never,
+			{
+				cwd: workspace,
+				toolCallId: "status-large-tail-render",
+				args: { action: "status", name: "status-large-tail", lines: 2 },
+			} as never,
+		);
+		const expandedText =
+			expandedResult
+				?.render(1_000_000)
+				.map((line) => line.trimEnd())
+				.join("\n") ?? "";
+		expect(Buffer.byteLength(expandedText)).toBeLessThanOrEqual(DEFAULT_MAX_BYTES);
 
 		await writeFile(
 			logPath,
@@ -329,6 +345,53 @@ describe("session_job", () => {
 			undefined,
 			context,
 		);
+		callbacks.stop();
+	});
+
+	it("does not accept a timestamped terminal observation beyond the wait deadline", async () => {
+		const agentDirectory = await createTemporaryDirectory();
+		const workspace = await createTemporaryDirectory();
+		const { callbacks } = createCallbackStream();
+		const context = createContext(workspace);
+		await callbacks.start(agentDirectory, "wait-late-terminal-session", context);
+		const tool = createSessionJobTool(callbacks, agentDirectory);
+
+		await tool.execute(
+			"start-wait-late-terminal",
+			{ action: "start", name: "wait-late-terminal", command: "true" },
+			undefined,
+			undefined,
+			context,
+		);
+		const exitCodePath = path.join(
+			agentDirectory,
+			"callbacks",
+			"wait-late-terminal-session",
+			"jobs",
+			"wait-late-terminal",
+			"exit-code",
+		);
+		await waitFor(async () => {
+			try {
+				await readFile(exitCodePath, "utf8");
+				return true;
+			} catch {
+				return false;
+			}
+		});
+		const future = new Date(Date.now() + 5_000);
+		await utimes(exitCodePath, future, future);
+
+		const waitResult = await tool.execute(
+			"wait-late-terminal",
+			{ action: "wait", name: "wait-late-terminal", timeoutSeconds: 0 },
+			undefined,
+			undefined,
+			context,
+		);
+		expect(waitResult.details?.job?.status).toBe("succeeded");
+		expect(waitResult.details?.waitTimedOut).toBe(true);
+		expect(waitResult.details?.completionAcknowledged).toBe(false);
 		callbacks.stop();
 	});
 
