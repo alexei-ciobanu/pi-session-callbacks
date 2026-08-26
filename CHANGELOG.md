@@ -8,6 +8,9 @@
 - Show the submitted Bash command in `session_job start` calls.
 - Render quiet callbacks as durable TUI-only entries that never enter agent context or trigger agent turns.
 - Bound `session_job logs` results to Pi's 50KB and 2,000-line tool-output limits while preserving the complete durable log.
+- Added bounded `session_job wait` with cancellation, zero-second snapshots, and coordinated completion acknowledgement.
+- Atomically arbitrate automatic completions between the callback watcher and concurrent waiters.
+- Show relative job start age in status, wait, list, start, logs, and stop summaries.
 
 ### Fixed
 

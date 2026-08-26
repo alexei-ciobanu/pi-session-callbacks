@@ -4,7 +4,12 @@ import path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { DEFAULT_MAX_BYTES } from "@earendil-works/pi-coding-agent";
 import { afterEach, describe, expect, it } from "vitest";
-import { buildCallbackBootstrap, CallbackStream, parseCallbackFileName } from "../src/callbacks.js";
+import {
+	buildCallbackBootstrap,
+	CallbackStream,
+	jobCompletionFileName,
+	parseCallbackFileName,
+} from "../src/callbacks.js";
 import { createSessionJobTool, readLogTail, validateJobName } from "../src/jobs.js";
 
 const temporaryDirectories: string[] = [];
@@ -88,6 +93,10 @@ describe("callback inbox", () => {
 	it("classifies complete waking and quiet callback files", () => {
 		expect(parseCallbackFileName("callback-1.wake")).toEqual({ wake: true });
 		expect(parseCallbackFileName("callback-2.quiet")).toEqual({ wake: false });
+		expect(parseCallbackFileName(jobCompletionFileName("tests-linux_1.0"))).toEqual({
+			wake: true,
+			jobName: "tests-linux_1.0",
+		});
 		expect(parseCallbackFileName(".callback-2.tmp")).toBeUndefined();
 		expect(parseCallbackFileName("notes.txt")).toBeUndefined();
 	});
@@ -178,14 +187,349 @@ describe("session_job", () => {
 		expect(validateJobName("has spaces")).toBe(false);
 	});
 
+	it("waits for success and acknowledges the automatic completion callback", async () => {
+		const agentDirectory = await createTemporaryDirectory();
+		const workspace = await createTemporaryDirectory();
+		const { callbacks, messages } = createCallbackStream();
+		const context = createContext(workspace);
+		await callbacks.start(agentDirectory, "wait-success-session", context);
+		const tool = createSessionJobTool(callbacks, agentDirectory);
+
+		await tool.execute(
+			"start-wait-success",
+			{ action: "start", name: "wait-success", command: "sleep 0.1; printf 'done\\n'" },
+			undefined,
+			undefined,
+			context,
+		);
+		const waitResult = await tool.execute(
+			"wait-success",
+			{ action: "wait", name: "wait-success", timeoutSeconds: 2 },
+			undefined,
+			undefined,
+			context,
+		);
+
+		expect(waitResult.details?.job?.status).toBe("succeeded");
+		expect(waitResult.details?.waitTimedOut).toBe(false);
+		expect(waitResult.details?.completionAcknowledged).toBe(true);
+		await new Promise((resolve) => setTimeout(resolve, 75));
+		expect(messages).toHaveLength(0);
+		callbacks.stop();
+	});
+
+	it("delivers the normal callback after wait times out", async () => {
+		const agentDirectory = await createTemporaryDirectory();
+		const workspace = await createTemporaryDirectory();
+		const { callbacks, messages } = createCallbackStream();
+		const context = createContext(workspace);
+		await callbacks.start(agentDirectory, "wait-timeout-session", context);
+		const tool = createSessionJobTool(callbacks, agentDirectory);
+
+		await tool.execute(
+			"start-wait-timeout",
+			{ action: "start", name: "wait-timeout", command: "sleep 0.15" },
+			undefined,
+			undefined,
+			context,
+		);
+		const waitResult = await tool.execute(
+			"wait-timeout",
+			{ action: "wait", name: "wait-timeout", timeoutSeconds: 0.01 },
+			undefined,
+			undefined,
+			context,
+		);
+
+		expect(waitResult.details?.job?.status).toBe("running");
+		expect(waitResult.details?.waitTimedOut).toBe(true);
+		expect(waitResult.details?.completionAcknowledged).toBe(false);
+		await waitFor(() => messages.length === 1);
+		expect(messages[0]?.message.content).toBe("Job wait-timeout completed successfully.");
+		callbacks.stop();
+	});
+
+	it("wait zero returns an immediate running snapshot without replacing status", async () => {
+		const agentDirectory = await createTemporaryDirectory();
+		const workspace = await createTemporaryDirectory();
+		const { callbacks } = createCallbackStream();
+		const context = createContext(workspace);
+		await callbacks.start(agentDirectory, "wait-zero-session", context);
+		const tool = createSessionJobTool(callbacks, agentDirectory);
+
+		await tool.execute(
+			"start-wait-zero",
+			{ action: "start", name: "wait-zero", command: "sleep 30" },
+			undefined,
+			undefined,
+			context,
+		);
+		const statusResult = await tool.execute(
+			"status-wait-zero",
+			{ action: "status", name: "wait-zero" },
+			undefined,
+			undefined,
+			context,
+		);
+		const waitResult = await tool.execute(
+			"wait-zero",
+			{ action: "wait", name: "wait-zero", timeoutSeconds: 0 },
+			undefined,
+			undefined,
+			context,
+		);
+
+		expect(statusResult.details?.job?.status).toBe("running");
+		expect(waitResult.details?.job?.status).toBe(statusResult.details?.job?.status);
+		expect(waitResult.details?.waitTimedOut).toBe(true);
+		await tool.execute("stop-wait-zero", { action: "stop", name: "wait-zero" }, undefined, undefined, context);
+		callbacks.stop();
+	});
+
+	it("wait reports a failed exit without a duplicate callback", async () => {
+		const agentDirectory = await createTemporaryDirectory();
+		const workspace = await createTemporaryDirectory();
+		const { callbacks, messages } = createCallbackStream();
+		const context = createContext(workspace);
+		await callbacks.start(agentDirectory, "wait-failure-session", context);
+		const tool = createSessionJobTool(callbacks, agentDirectory);
+
+		await tool.execute(
+			"start-wait-failure",
+			{ action: "start", name: "wait-failure", command: "sleep 0.1; exit 7" },
+			undefined,
+			undefined,
+			context,
+		);
+		const waitResult = await tool.execute(
+			"wait-failure",
+			{ action: "wait", name: "wait-failure", timeoutSeconds: 2 },
+			undefined,
+			undefined,
+			context,
+		);
+
+		expect(waitResult.details?.job?.status).toBe("failed");
+		expect(waitResult.details?.job?.exitCode).toBe(7);
+		expect(waitResult.details?.completionAcknowledged).toBe(true);
+		await new Promise((resolve) => setTimeout(resolve, 75));
+		expect(messages).toHaveLength(0);
+		callbacks.stop();
+	});
+
+	it("coordinates concurrent waiters without delivering a completion callback", async () => {
+		const agentDirectory = await createTemporaryDirectory();
+		const workspace = await createTemporaryDirectory();
+		const { callbacks, messages } = createCallbackStream();
+		const context = createContext(workspace);
+		await callbacks.start(agentDirectory, "wait-concurrent-session", context);
+		const tool = createSessionJobTool(callbacks, agentDirectory);
+
+		await tool.execute(
+			"start-wait-concurrent",
+			{ action: "start", name: "wait-concurrent", command: "sleep 0.1" },
+			undefined,
+			undefined,
+			context,
+		);
+		const results = await Promise.all([
+			tool.execute(
+				"wait-concurrent-1",
+				{ action: "wait", name: "wait-concurrent", timeoutSeconds: 2 },
+				undefined,
+				undefined,
+				context,
+			),
+			tool.execute(
+				"wait-concurrent-2",
+				{ action: "wait", name: "wait-concurrent", timeoutSeconds: 2 },
+				undefined,
+				undefined,
+				context,
+			),
+		]);
+
+		expect(results.map((result) => result.details?.job?.status)).toEqual(["succeeded", "succeeded"]);
+		expect(results.filter((result) => result.details?.completionAcknowledged)).toHaveLength(1);
+		await new Promise((resolve) => setTimeout(resolve, 75));
+		expect(messages).toHaveLength(0);
+		callbacks.stop();
+	});
+
+	it("atomically acknowledges one completion across concurrent waiters", async () => {
+		const agentDirectory = await createTemporaryDirectory();
+		const { callbacks, messages } = createCallbackStream();
+		const context = createContext(agentDirectory);
+		await callbacks.start(agentDirectory, "atomic-ack-session", context);
+		const inbox = path.join(agentDirectory, "callbacks", "atomic-ack-session", "inbox");
+		const first = callbacks.beginJobWait("atomic-ack");
+		const second = callbacks.beginJobWait("atomic-ack");
+		await writeFile(path.join(inbox, jobCompletionFileName("atomic-ack")), "finished", "utf8");
+
+		const acknowledgements = await Promise.all([first.acknowledgeCompletion(), second.acknowledgeCompletion()]);
+
+		expect(acknowledgements.filter(Boolean)).toHaveLength(1);
+		first.release();
+		second.release();
+		await new Promise((resolve) => setTimeout(resolve, 75));
+		expect(messages).toHaveLength(0);
+		callbacks.stop();
+	});
+
+	it("arbitrates scanner delivery and waiter acknowledgement exactly once", async () => {
+		const agentDirectory = await createTemporaryDirectory();
+		const { callbacks, messages } = createCallbackStream(10_000);
+		const context = createContext(agentDirectory);
+		await callbacks.start(agentDirectory, "scan-ack-race-session", context);
+		const inbox = path.join(agentDirectory, "callbacks", "scan-ack-race-session", "inbox");
+
+		for (let iteration = 0; iteration < 20; iteration += 1) {
+			const jobName = `scan-ack-${iteration}`;
+			const messageCountBefore = messages.length;
+			await writeFile(path.join(inbox, jobCompletionFileName(jobName)), `finished ${iteration}`, "utf8");
+			const [, acknowledged] = await Promise.all([
+				callbacks.scan(context),
+				callbacks.acknowledgeJobCompletion(jobName),
+			]);
+			await waitFor(() => messages.length > messageCountBefore || acknowledged);
+			expect(messages.length - messageCountBefore + Number(acknowledged)).toBe(1);
+		}
+
+		callbacks.stop();
+	});
+
+	it("rescans a deferred completion as soon as the final waiter releases", async () => {
+		const agentDirectory = await createTemporaryDirectory();
+		const { callbacks, messages } = createCallbackStream(10_000);
+		const context = createContext(agentDirectory);
+		await callbacks.start(agentDirectory, "release-rescan-session", context);
+		const inbox = path.join(agentDirectory, "callbacks", "release-rescan-session", "inbox");
+		const registration = callbacks.beginJobWait("release-rescan");
+		await writeFile(
+			path.join(inbox, jobCompletionFileName("release-rescan")),
+			"Job release-rescan completed successfully.",
+			"utf8",
+		);
+
+		await new Promise((resolve) => setTimeout(resolve, 75));
+		expect(messages).toHaveLength(0);
+		registration.release();
+		await waitFor(() => messages.length === 1);
+		expect(messages[0]?.message.content).toBe("Job release-rescan completed successfully.");
+		callbacks.stop();
+	});
+
+	it("delivers unrelated callbacks while a job completion is deferred", async () => {
+		const agentDirectory = await createTemporaryDirectory();
+		const { callbacks, messages } = createCallbackStream();
+		const context = createContext(agentDirectory);
+		await callbacks.start(agentDirectory, "manual-during-wait-session", context);
+		const inbox = path.join(agentDirectory, "callbacks", "manual-during-wait-session", "inbox");
+		const registration = callbacks.beginJobWait("deferred-job");
+		await writeFile(path.join(inbox, jobCompletionFileName("deferred-job")), "automatic completion", "utf8");
+		await writeFile(path.join(inbox, "manual.wake"), "manual progress", "utf8");
+
+		await waitFor(() => messages.length === 1);
+		expect(messages[0]?.message.content).toBe("manual progress");
+		expect(await registration.acknowledgeCompletion()).toBe(true);
+		registration.release();
+		await new Promise((resolve) => setTimeout(resolve, 75));
+		expect(messages).toHaveLength(1);
+		callbacks.stop();
+	});
+
+	it("preserves active completion deferral across a callback stream restart", async () => {
+		const agentDirectory = await createTemporaryDirectory();
+		const { callbacks, messages } = createCallbackStream();
+		const context = createContext(agentDirectory);
+		await callbacks.start(agentDirectory, "active-restart-session", context);
+		const registration = callbacks.beginJobWait("active-restart");
+		callbacks.stop();
+		await callbacks.start(agentDirectory, "active-restart-session", context);
+		const inbox = path.join(agentDirectory, "callbacks", "active-restart-session", "inbox");
+		await writeFile(path.join(inbox, jobCompletionFileName("active-restart")), "finished", "utf8");
+
+		await new Promise((resolve) => setTimeout(resolve, 75));
+		expect(messages).toHaveLength(0);
+		expect(await registration.acknowledgeCompletion()).toBe(true);
+		registration.release();
+		callbacks.stop();
+	});
+
+	it("releases callback delivery when wait is cancelled", async () => {
+		const agentDirectory = await createTemporaryDirectory();
+		const workspace = await createTemporaryDirectory();
+		const { callbacks, messages } = createCallbackStream();
+		const context = createContext(workspace);
+		await callbacks.start(agentDirectory, "wait-cancel-session", context);
+		const tool = createSessionJobTool(callbacks, agentDirectory);
+
+		await tool.execute(
+			"start-wait-cancel",
+			{ action: "start", name: "wait-cancel", command: "sleep 0.15" },
+			undefined,
+			undefined,
+			context,
+		);
+		const controller = new AbortController();
+		const waitPromise = tool.execute(
+			"wait-cancel",
+			{ action: "wait", name: "wait-cancel", timeoutSeconds: 2 },
+			controller.signal,
+			undefined,
+			context,
+		);
+		setTimeout(() => controller.abort(), 25);
+
+		await expect(waitPromise).rejects.toThrow();
+		await waitFor(() => messages.length === 1);
+		expect(messages[0]?.message.content).toBe("Job wait-cancel completed successfully.");
+		callbacks.stop();
+	});
+
+	it("delivers a durable job completion after the callback stream restarts", async () => {
+		const agentDirectory = await createTemporaryDirectory();
+		const workspace = await createTemporaryDirectory();
+		const first = createCallbackStream();
+		const context = createContext(workspace);
+		await first.callbacks.start(agentDirectory, "wait-resume-session", context);
+		const tool = createSessionJobTool(first.callbacks, agentDirectory);
+
+		await tool.execute(
+			"start-wait-resume",
+			{ action: "start", name: "wait-resume", command: "sleep 0.1" },
+			undefined,
+			undefined,
+			context,
+		);
+		first.callbacks.stop();
+
+		const jobDirectory = path.join(agentDirectory, "callbacks", "wait-resume-session", "jobs", "wait-resume");
+		await waitFor(async () => {
+			try {
+				await readFile(path.join(jobDirectory, "exit-code"), "utf8");
+				return true;
+			} catch {
+				return false;
+			}
+		});
+
+		const resumed = createCallbackStream();
+		await resumed.callbacks.start(agentDirectory, "wait-resume-session", context);
+		await waitFor(() => resumed.messages.length === 1);
+		expect(resumed.messages[0]?.message.content).toBe("Job wait-resume completed successfully.");
+		resumed.callbacks.stop();
+	});
+
 	it("renders compact action-aware calls and results", () => {
 		const { callbacks } = createCallbackStream();
 		const tool = createSessionJobTool(callbacks, "/agent");
+		const createdAt = new Date(Date.now() - 65_000).toISOString();
 		const job = {
 			name: "training",
 			command: "train",
 			cwd: "/workspace",
-			createdAt: "2026-07-22T00:00:00.000Z",
+			createdAt,
 			pid: 123,
 			status: "succeeded" as const,
 			exitCode: 0,
@@ -211,7 +555,7 @@ describe("session_job", () => {
 			{ cwd: "/workspace", toolCallId: "result-render", args: { action: "status", name: "training" } } as never,
 		);
 		const collapsedText = renderedText(collapsed);
-		expect(collapsedText).toBe("training · succeeded · exit 0");
+		expect(collapsedText).toBe("training · succeeded · started 1m ago · exit 0");
 		expect(collapsedText).not.toContain("/workspace");
 
 		const expanded = tool.renderResult?.(
@@ -223,6 +567,7 @@ describe("session_job", () => {
 		const expandedText = renderedText(expanded);
 		expect(expandedText).toContain("cwd: /workspace");
 		expect(expandedText).toContain("log: /callbacks/jobs/training/job.log");
+		expect(expandedText).toContain(`started: ${createdAt} (started 1m ago)`);
 	});
 
 	it("shows the submitted Bash command in the start call", () => {
@@ -235,6 +580,42 @@ describe("session_job", () => {
 		);
 
 		expect(renderedText(component)).toBe("session_job start training\n$ python train.py --epochs 10\necho done");
+	});
+
+	it("renders bounded wait calls and timeout results", () => {
+		const { callbacks } = createCallbackStream();
+		const tool = createSessionJobTool(callbacks, "/agent");
+		const call = tool.renderCall?.(
+			{ action: "wait", name: "training", timeoutSeconds: 2.5 },
+			identityTheme as never,
+			{ argsComplete: true, cwd: "/workspace", toolCallId: "wait-render" } as never,
+		);
+		expect(renderedText(call)).toBe("session_job wait training (2.5s)");
+
+		const result = {
+			content: [{ type: "text" as const, text: "Wait timed out" }],
+			details: {
+				action: "wait" as const,
+				job: {
+					name: "training",
+					command: "train",
+					cwd: "/workspace",
+					createdAt: new Date(Date.now() - 65_000).toISOString(),
+					pid: 123,
+					status: "running" as const,
+					logPath: "/callbacks/jobs/training/job.log",
+				},
+				waitTimedOut: true,
+				waitedMs: 2_500,
+			},
+		};
+		const component = tool.renderResult?.(
+			result,
+			{ expanded: false, isPartial: false },
+			identityTheme as never,
+			{ cwd: "/workspace", toolCallId: "wait-render", args: { action: "wait", name: "training" } } as never,
+		);
+		expect(renderedText(component)).toBe("training · running · started 1m ago · pid 123 · wait timed out");
 	});
 
 	it("renders log output without repeating job metadata when collapsed", () => {
@@ -307,6 +688,28 @@ describe("session_job", () => {
 		expect(logPath).toBeDefined();
 		if (!logPath) throw new Error("job did not return a log path");
 		expect(await readFile(logPath, "utf8")).toContain("first\nlast\n");
+		callbacks.stop();
+	});
+
+	it("recreates a missing callback inbox before publishing job completion", async () => {
+		const agentDirectory = await createTemporaryDirectory();
+		const workspace = await createTemporaryDirectory();
+		const { callbacks, messages } = createCallbackStream();
+		const context = createContext(workspace);
+		await callbacks.start(agentDirectory, "recreate-inbox-session", context);
+		const tool = createSessionJobTool(callbacks, agentDirectory);
+		await tool.execute(
+			"start-recreate-inbox",
+			{ action: "start", name: "recreate-inbox", command: "sleep 0.15" },
+			undefined,
+			undefined,
+			context,
+		);
+		const inbox = path.join(agentDirectory, "callbacks", "recreate-inbox-session", "inbox");
+		await rm(inbox, { recursive: true, force: true });
+
+		await waitFor(() => messages.length === 1);
+		expect(messages[0]?.message.content).toBe("Job recreate-inbox completed successfully.");
 		callbacks.stop();
 	});
 
