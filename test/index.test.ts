@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import { mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -401,6 +402,42 @@ describe("session_job", () => {
 		);
 
 		expect(updates).toHaveLength(1);
+		callbacks.stop();
+	});
+
+	it.skipIf(process.platform === "win32")("does not block on a non-regular replacement log", async () => {
+		const agentDirectory = await createTemporaryDirectory();
+		const workspace = await createTemporaryDirectory();
+		const { callbacks } = createCallbackStream();
+		const context = createContext(workspace);
+		await callbacks.start(agentDirectory, "wait-fifo-session", context);
+		const tool = createSessionJobTool(callbacks, agentDirectory);
+
+		const startResult = await tool.execute(
+			"start-wait-fifo",
+			{ action: "start", name: "wait-fifo", command: "sleep 30" },
+			undefined,
+			undefined,
+			context,
+		);
+		const logPath = startResult.details?.job?.logPath;
+		if (!logPath) throw new Error("job did not return a log path");
+		await rm(logPath);
+		execFileSync("mkfifo", [logPath]);
+
+		const startedAt = Date.now();
+		const waitResult = await tool.execute(
+			"wait-fifo",
+			{ action: "wait", name: "wait-fifo", timeoutSeconds: 0.05, lines: 1 },
+			undefined,
+			undefined,
+			context,
+		);
+		expect(Date.now() - startedAt).toBeLessThan(500);
+		expect(waitResult.details?.waitTimedOut).toBe(true);
+		expect(waitResult.details?.logText).toBe("(log unavailable: not a regular file)");
+
+		await tool.execute("stop-wait-fifo", { action: "stop", name: "wait-fifo" }, undefined, undefined, context);
 		callbacks.stop();
 	});
 

@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { constants as fsConstants } from "node:fs";
 import * as fsp from "node:fs/promises";
 import * as path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
@@ -341,9 +342,10 @@ function removeTrailingIncompleteUtf8Bytes(buffer: Buffer): Buffer {
 }
 
 export async function readLogTail(logPath: string, lines: number, maxBytes = DEFAULT_MAX_BYTES): Promise<string> {
-	const handle = await fsp.open(logPath, "r");
+	const handle = await fsp.open(logPath, fsConstants.O_RDONLY | fsConstants.O_NONBLOCK);
 	try {
 		const stat = await handle.stat();
+		if (!stat.isFile()) return "(log unavailable: not a regular file)";
 		if (stat.size === 0) return "(no output yet)";
 
 		const contentByteLimit = Math.max(1, maxBytes - LOG_TRUNCATION_NOTICE_BYTES);
