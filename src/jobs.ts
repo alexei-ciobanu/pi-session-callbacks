@@ -21,6 +21,8 @@ const DEFAULT_LOG_LINES = 200;
 const LOG_TRUNCATION_NOTICE_BYTES = 128;
 const DEFAULT_WAIT_SECONDS = 30;
 const MAX_WAIT_SECONDS = 3_600;
+const WAIT_PROGRESS_POLL_MS = 500;
+const WAIT_PROGRESS_HEARTBEAT_MS = 5_000;
 
 const SESSION_JOB_PARAMETERS = Type.Object({
 	action: StringEnum(["start", "list", "status", "wait", "logs", "stop"] as const, {
@@ -363,6 +365,7 @@ async function waitForJob(
 	timeoutSeconds: number,
 	signal: AbortSignal | undefined,
 	callbacks: CallbackStream,
+	onProgress?: (job: JobSnapshot, waitedMs: number) => Promise<void>,
 ): Promise<{
 	job: JobSnapshot;
 	timedOut: boolean;
@@ -372,6 +375,7 @@ async function waitForJob(
 	const startedAt = Date.now();
 	const deadline = startedAt + timeoutSeconds * 1_000;
 	const waitRegistration = callbacks.beginJobWait(jobName);
+	let nextProgressAt = startedAt;
 	try {
 		while (true) {
 			signal?.throwIfAborted();
@@ -386,7 +390,8 @@ async function waitForJob(
 				};
 			}
 
-			const remainingMs = deadline - Date.now();
+			const now = Date.now();
+			const remainingMs = deadline - now;
 			if (remainingMs <= 0) {
 				return {
 					job,
@@ -395,11 +400,35 @@ async function waitForJob(
 					completionAcknowledged: false,
 				};
 			}
+			if (onProgress && now >= nextProgressAt) {
+				await onProgress(job, now - startedAt);
+				nextProgressAt = now + WAIT_PROGRESS_POLL_MS;
+			}
 			await delay(Math.min(remainingMs, 100), undefined, { signal });
 		}
 	} finally {
 		waitRegistration.release();
 	}
+}
+
+async function withOptionalLogTail(
+	baseText: string,
+	job: JobSnapshot,
+	lines: number | undefined,
+): Promise<{ text: string; logText?: string }> {
+	if (lines === undefined) return { text: baseText };
+	const separator = "\n\nRecent output:\n";
+	const availableLogBytes = Math.max(
+		1,
+		DEFAULT_MAX_BYTES - Buffer.byteLength(baseText) - Buffer.byteLength(separator),
+	);
+	const logText = await readLogTail(job.logPath, lines, availableLogBytes);
+	return { text: `${baseText}${separator}${logText}`, logText };
+}
+
+function waitProgressSignature(job: JobSnapshot, waitedMs: number, logText: string | undefined): string {
+	const heartbeat = Math.floor(waitedMs / WAIT_PROGRESS_HEARTBEAT_MS);
+	return `${job.status}\0${job.exitCode ?? ""}\0${heartbeat}\0${logText ?? ""}`;
 }
 
 async function runTaskkill(pid: number): Promise<void> {
@@ -506,10 +535,11 @@ export function createSessionJobTool(callbacks: CallbackStream, agentDirectory: 
 		promptGuidelines: [
 			"Use session_job for long-running commands instead of backgrounding commands through bash.",
 			"Use session_job wait for a bounded wait instead of sleeping or repeatedly polling status.",
+			"Pass lines with session_job status or wait to include a bounded recent-output tail when useful.",
 			"Use session_job logs or status to inspect a durable job without waiting.",
 		],
 		parameters: SESSION_JOB_PARAMETERS,
-		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+		async execute(_toolCallId, params, signal, onUpdate, ctx) {
 			const normalized = params as SessionJobParams;
 			const jobsDirectory = callbacks.jobsDirectory;
 			if (!jobsDirectory) throw new Error("Callback stream is not initialized");
@@ -531,32 +561,58 @@ export function createSessionJobTool(callbacks: CallbackStream, agentDirectory: 
 			const jobDirectory = path.join(jobsDirectory, name);
 			if (normalized.action === "status") {
 				const job = await readJob(jobDirectory);
+				const output = await withOptionalLogTail(formatJob(job), job, normalized.lines);
 				return {
-					content: [{ type: "text", text: formatJob(job) }],
-					details: { action: normalized.action, job },
+					content: [{ type: "text", text: output.text }],
+					details: { action: normalized.action, job, logText: output.logText },
 				};
 			}
 			if (normalized.action === "wait") {
+				let lastProgressSignature: string | undefined;
 				const result = await waitForJob(
 					jobDirectory,
 					name,
 					normalized.timeoutSeconds ?? DEFAULT_WAIT_SECONDS,
 					signal,
 					callbacks,
+					onUpdate
+						? async (job, waitedMs) => {
+								const baseText = `Wait in progress.\n${formatJob(job)}`;
+								const output = await withOptionalLogTail(baseText, job, normalized.lines);
+								const signature = waitProgressSignature(job, waitedMs, output.logText);
+								if (signature === lastProgressSignature) return;
+								lastProgressSignature = signature;
+								onUpdate({
+									content: [{ type: "text", text: output.text }],
+									details: {
+										action: normalized.action,
+										job,
+										waitedMs,
+										logText: output.logText,
+									},
+								});
+							}
+						: undefined,
 				);
 				const outcome = result.timedOut
 					? "Wait timed out; job is still active."
 					: result.completionAcknowledged
 						? "Job reached a terminal state. Pending completion callback acknowledged."
 						: "Job reached a terminal state. No pending completion callback was acknowledged.";
+				const output = await withOptionalLogTail(
+					`${outcome}\n${formatJob(result.job)}`,
+					result.job,
+					normalized.lines,
+				);
 				return {
-					content: [{ type: "text", text: `${outcome}\n${formatJob(result.job)}` }],
+					content: [{ type: "text", text: output.text }],
 					details: {
 						action: normalized.action,
 						job: result.job,
 						waitTimedOut: result.timedOut,
 						waitedMs: result.waitedMs,
 						completionAcknowledged: result.completionAcknowledged,
+						logText: output.logText,
 					},
 				};
 			}
@@ -605,12 +661,26 @@ export function createSessionJobTool(callbacks: CallbackStream, agentDirectory: 
 					? `${formatExpandedJob(job)}\n\n${logText ?? "(no output yet)"}`
 					: (logText ?? "(no output yet)");
 			} else if (job) {
-				const waitResult = action === "wait" ? (waitTimedOut ? " · wait timed out" : " · completion observed") : "";
+				const waitState =
+					waitTimedOut === undefined ? "waiting" : waitTimedOut ? "timed out" : "completion observed";
+				const waitResult =
+					action !== "wait"
+						? ""
+						: waitTimedOut === undefined
+							? " · waiting"
+							: waitTimedOut
+								? " · wait timed out"
+								: " · completion observed";
+				const liveWaitDuration =
+					action === "wait" && waitTimedOut === undefined && waitedMs !== undefined
+						? ` · waited ${formatAge(waitedMs)}`
+						: "";
 				text = options.expanded
-					? `${formatExpandedJob(job)}${
-							action === "wait" ? `\n  wait: ${waitTimedOut ? "timed out" : "completion observed"}` : ""
-						}${waitedMs === undefined ? "" : `\n  waited: ${waitedMs}ms`}`
-					: `${formatCompactJob(job)}${waitResult}`;
+					? `${formatExpandedJob(job)}${action === "wait" ? `\n  wait: ${waitState}` : ""}${
+							waitedMs === undefined ? "" : `\n  waited: ${waitedMs}ms`
+						}`
+					: `${formatCompactJob(job)}${waitResult}${liveWaitDuration}`;
+				if (logText !== undefined) text += `\n\n${logText}`;
 			} else {
 				text = fallback;
 			}

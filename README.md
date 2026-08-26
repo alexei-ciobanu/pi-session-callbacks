@@ -57,7 +57,9 @@ Explicit names may contain alphanumerics, `.`, `_`, and `-`, and cannot be reuse
 
 `logs` returns at most 2,000 lines and 50KB to the agent, whichever limit is
 reached first. The complete durable log remains available at the path shown by
-expanded tool output.
+expanded tool output. The existing `lines` field can also be supplied to
+`status` or `wait` to include an opt-in, bounded recent-output tail in the same
+tool result. Omitting `lines` preserves metadata-only status and wait output.
 
 `wait` defaults to 30 seconds and accepts `timeoutSeconds` from 0 to 3,600. A
 zero-second wait returns immediately. While a wait is active, the job's normal
@@ -69,6 +71,13 @@ side-effect-free snapshot action and is retained for compatibility.
 Job summaries include how long ago the job started. Expanded output also shows
 the exact ISO start time. For `wait`, this job age is separate from the time
 spent by that individual wait call.
+
+While `wait` is active, it publishes throttled partial tool updates. These show
+the current job state and wait duration, plus the requested log tail when
+`lines` is supplied. Unchanged output is suppressed between five-second
+heartbeats. Partial updates stop when the wait completes, times out, or is
+cancelled. Automatic completion callbacks remain concise and never include job
+logs.
 
 ### Progress callbacks
 
