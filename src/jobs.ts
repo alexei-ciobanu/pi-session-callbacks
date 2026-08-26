@@ -409,10 +409,9 @@ async function waitForJob(
 			const observedAt = Date.now();
 			if (isTerminal(job)) {
 				const endedAt = job.endedAt ? Date.parse(job.endedAt) : Number.NaN;
-				const completedWithinDeadline =
-					observedAt <= deadline ||
-					(Number.isFinite(endedAt) && endedAt <= deadline) ||
-					(firstObservation && !Number.isFinite(endedAt));
+				const completedWithinDeadline = Number.isFinite(endedAt)
+					? endedAt <= deadline
+					: observedAt <= deadline || firstObservation;
 				if (!completedWithinDeadline) {
 					return {
 						job,
