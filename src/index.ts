@@ -67,5 +67,5 @@ export function createSessionCallbacksExtension(options: SessionCallbacksOptions
 
 export default createSessionCallbacksExtension();
 
-export { buildCallbackBootstrap, CallbackStream, parseCallbackFileName } from "./callbacks.js";
+export { buildCallbackBootstrap, CallbackStream, jobCompletionFileName, parseCallbackFileName } from "./callbacks.js";
 export { createSessionJobTool, type JobSnapshot, type JobStatus, validateJobName } from "./jobs.js";

@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
 import * as fsp from "node:fs/promises";
 import * as path from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 import { StringEnum } from "@earendil-works/pi-ai";
 import {
 	DEFAULT_MAX_BYTES,
@@ -18,9 +19,11 @@ import type { CallbackStream } from "./callbacks.js";
 const JOB_NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,79}$/;
 const DEFAULT_LOG_LINES = 200;
 const LOG_TRUNCATION_NOTICE_BYTES = 128;
+const DEFAULT_WAIT_SECONDS = 30;
+const MAX_WAIT_SECONDS = 3_600;
 
 const SESSION_JOB_PARAMETERS = Type.Object({
-	action: StringEnum(["start", "list", "status", "logs", "stop"] as const, {
+	action: StringEnum(["start", "list", "status", "wait", "logs", "stop"] as const, {
 		description: "Job operation to perform",
 	}),
 	name: Type.Optional(Type.String({ description: "Job name" })),
@@ -33,14 +36,22 @@ const SESSION_JOB_PARAMETERS = Type.Object({
 			maximum: DEFAULT_MAX_LINES,
 		}),
 	),
+	timeoutSeconds: Type.Optional(
+		Type.Number({
+			description: "Seconds to wait; zero returns immediately",
+			minimum: 0,
+			maximum: MAX_WAIT_SECONDS,
+		}),
+	),
 });
 
 type SessionJobParams = {
-	action: "start" | "list" | "status" | "logs" | "stop";
+	action: "start" | "list" | "status" | "wait" | "logs" | "stop";
 	name?: string;
 	command?: string;
 	cwd?: string;
 	lines?: number;
+	timeoutSeconds?: number;
 };
 
 type JobMetadata = {
@@ -66,6 +77,9 @@ type SessionJobDetails = {
 	jobs?: JobSnapshot[];
 	logPath?: string;
 	logText?: string;
+	waitTimedOut?: boolean;
+	waitedMs?: number;
+	completionAcknowledged?: boolean;
 };
 
 type SessionJobTool = ToolDefinition<typeof SESSION_JOB_PARAMETERS, SessionJobDetails>;
@@ -195,14 +209,18 @@ cd -- "$PI_JOB_CWD"
 printf '%s\n' running > "$PI_JOB_DIR/state"
 bash -c "$PI_JOB_COMMAND"
 status=$?
+completion_id="job-completion-$PI_JOB_NAME"
+completion_temporary="$PI_CALLBACK_DIR/inbox/.$completion_id-$$.tmp"
+if ((status == 0)); then
+  completion_message="Job $PI_JOB_NAME completed successfully."
+else
+  completion_message="Job $PI_JOB_NAME exited with status $status."
+fi
+printf '%s' "$completion_message" > "$completion_temporary"
+mv -- "$completion_temporary" "$PI_CALLBACK_DIR/inbox/$completion_id.wake"
 temporary="$PI_JOB_DIR/.exit-code-$$.tmp"
 printf '%s\n' "$status" > "$temporary"
 mv -- "$temporary" "$PI_JOB_DIR/exit-code"
-if ((status == 0)); then
-  pi-callback "Job $PI_JOB_NAME completed successfully."
-else
-  pi-callback "Job $PI_JOB_NAME exited with status $status."
-fi
 exit "$status"
 `;
 }
@@ -331,6 +349,55 @@ async function waitForExit(pid: number, timeoutMs: number): Promise<boolean> {
 	return !isProcessAlive(pid);
 }
 
+function isTerminal(job: JobSnapshot): boolean {
+	return job.status !== "starting" && job.status !== "running";
+}
+
+async function waitForJob(
+	jobDirectory: string,
+	jobName: string,
+	timeoutSeconds: number,
+	signal: AbortSignal | undefined,
+	callbacks: CallbackStream,
+): Promise<{
+	job: JobSnapshot;
+	timedOut: boolean;
+	waitedMs: number;
+	completionAcknowledged: boolean;
+}> {
+	const startedAt = Date.now();
+	const deadline = startedAt + timeoutSeconds * 1_000;
+	const releaseWaiter = callbacks.beginJobWait(jobName);
+	try {
+		while (true) {
+			signal?.throwIfAborted();
+			const job = await readJob(jobDirectory);
+			if (isTerminal(job)) {
+				const completionAcknowledged = await callbacks.acknowledgeJobCompletion(jobName);
+				return {
+					job,
+					timedOut: false,
+					waitedMs: Date.now() - startedAt,
+					completionAcknowledged,
+				};
+			}
+
+			const remainingMs = deadline - Date.now();
+			if (remainingMs <= 0) {
+				return {
+					job,
+					timedOut: true,
+					waitedMs: Date.now() - startedAt,
+					completionAcknowledged: false,
+				};
+			}
+			await delay(Math.min(remainingMs, 100), undefined, { signal });
+		}
+	} finally {
+		releaseWaiter();
+	}
+}
+
 async function runTaskkill(pid: number): Promise<void> {
 	const child = spawn("taskkill", ["/pid", String(pid), "/T", "/F"], { stdio: "ignore", windowsHide: true });
 	await new Promise<void>((resolve, reject) => {
@@ -400,6 +467,7 @@ function formatToolCall(params: Partial<SessionJobParams>): string {
 	if (params.action) parts.push(params.action);
 	if (params.name) parts.push(params.name);
 	if (params.action === "logs" && params.lines !== undefined) parts.push(`(${params.lines} lines)`);
+	if (params.action === "wait" && params.timeoutSeconds !== undefined) parts.push(`(${params.timeoutSeconds}s)`);
 	return parts.join(" ");
 }
 
@@ -408,14 +476,15 @@ export function createSessionJobTool(callbacks: CallbackStream, agentDirectory: 
 		name: "session_job",
 		label: "Session Job",
 		description:
-			"Start and manage durable background jobs that continue after Pi exits. Supports start, list, status, logs, and stop. Job output is written to durable logs. Commands run through Bash and can report progress with pi-callback.",
+			"Start and manage durable background jobs that continue after Pi exits. Supports start, list, status, wait, logs, and stop. Job output is written to durable logs. Commands run through Bash and can report progress with pi-callback.",
 		promptSnippet: "Start and manage durable background jobs",
 		promptGuidelines: [
 			"Use session_job for long-running commands instead of backgrounding commands through bash.",
-			"Use session_job logs or status to inspect a durable job; do not poll aggressively while waiting for its callback.",
+			"Use session_job wait for a bounded wait instead of sleeping or repeatedly polling status.",
+			"Use session_job logs or status to inspect a durable job without waiting.",
 		],
 		parameters: SESSION_JOB_PARAMETERS,
-		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
 			const normalized = params as SessionJobParams;
 			const jobsDirectory = callbacks.jobsDirectory;
 			if (!jobsDirectory) throw new Error("Callback stream is not initialized");
@@ -440,6 +509,28 @@ export function createSessionJobTool(callbacks: CallbackStream, agentDirectory: 
 				return {
 					content: [{ type: "text", text: formatJob(job) }],
 					details: { action: normalized.action, job },
+				};
+			}
+			if (normalized.action === "wait") {
+				const result = await waitForJob(
+					jobDirectory,
+					name,
+					normalized.timeoutSeconds ?? DEFAULT_WAIT_SECONDS,
+					signal,
+					callbacks,
+				);
+				const outcome = result.timedOut
+					? "Wait timed out; job is still active."
+					: "Job reached a terminal state. Completion callback acknowledged when pending.";
+				return {
+					content: [{ type: "text", text: `${outcome}\n${formatJob(result.job)}` }],
+					details: {
+						action: normalized.action,
+						job: result.job,
+						waitTimedOut: result.timedOut,
+						waitedMs: result.waitedMs,
+						completionAcknowledged: result.completionAcknowledged,
+					},
 				};
 			}
 			if (normalized.action === "logs") {
@@ -472,7 +563,7 @@ export function createSessionJobTool(callbacks: CallbackStream, agentDirectory: 
 				return new Text(theme.fg("toolOutput", fallback), 0, 0);
 			}
 
-			const { action, job, jobs, logText } = result.details;
+			const { action, job, jobs, logText, waitTimedOut, waitedMs } = result.details;
 			let text: string;
 			if (action === "list") {
 				if (!jobs || jobs.length === 0) {
@@ -487,7 +578,10 @@ export function createSessionJobTool(callbacks: CallbackStream, agentDirectory: 
 					? `${formatExpandedJob(job)}\n\n${logText ?? "(no output yet)"}`
 					: (logText ?? "(no output yet)");
 			} else if (job) {
-				text = options.expanded ? formatExpandedJob(job) : formatCompactJob(job);
+				const waitResult = action === "wait" ? (waitTimedOut ? " · wait timed out" : " · completion observed") : "";
+				text = options.expanded
+					? `${formatExpandedJob(job)}${waitedMs === undefined ? "" : `\n  waited: ${waitedMs}ms`}`
+					: `${formatCompactJob(job)}${waitResult}`;
 			} else {
 				text = fallback;
 			}

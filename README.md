@@ -31,13 +31,14 @@ Restart Pi or run `/reload` after installation.
 
 ## `session_job` tool
 
-The extension registers one LLM-callable tool with five actions:
+The extension registers one LLM-callable tool with six actions:
 
 | Action | Required fields | Purpose |
 |---|---|---|
 | `start` | `command` | Start a detached Bash command |
 | `list` | none | List jobs belonging to the current Pi session |
 | `status` | `name` | Inspect one job |
+| `wait` | `name` | Wait up to a bounded timeout for one job |
 | `logs` | `name` | Read the tail of its durable log |
 | `stop` | `name` | Terminate its process tree |
 
@@ -58,6 +59,13 @@ Explicit names may contain alphanumerics, `.`, `_`, and `-`, and cannot be reuse
 reached first. The complete durable log remains available at the path shown by
 expanded tool output.
 
+`wait` defaults to 30 seconds and accepts `timeoutSeconds` from 0 to 3,600. A
+zero-second wait returns immediately. While a wait is active, the job's normal
+waking completion callback is deferred; if the wait observes terminal state,
+it acknowledges that callback so completion enters agent context only once.
+Timeout or cancellation leaves callback delivery intact. `status` remains the
+side-effect-free snapshot action and is retained for compatibility.
+
 ### Progress callbacks
 
 Commands started through `session_job` receive `PI_CALLBACK_DIR` and a `pi-callback` helper on `PATH`:
@@ -67,7 +75,9 @@ pi-callback --no-wake "processed 200/1000"
 pi-callback "input data is invalid; intervention required"
 ```
 
-Callbacks wake Pi by default. A successful or failed job automatically emits a waking completion callback.
+Callbacks wake Pi by default. A successful or failed job automatically emits a
+waking completion callback unless an active `wait` observes and acknowledges
+that completion first.
 
 `--no-wake` updates are rendered immediately as durable, TUI-only session entries. They are never sent to the agent and cannot trigger a turn. Use a waking callback when information needs the agent's attention or context.
 

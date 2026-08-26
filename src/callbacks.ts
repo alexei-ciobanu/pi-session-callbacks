@@ -7,6 +7,7 @@ const MAX_CALLBACK_BYTES = 16 * 1024;
 const MAX_MESSAGE_CHARS = 12 * 1024;
 const MAX_CALLBACKS_PER_SCAN = 100;
 const DEFAULT_RESCAN_INTERVAL_MS = 2_000;
+const JOB_COMPLETION_FILE_PATTERN = /^job-completion-([A-Za-z0-9][A-Za-z0-9_.-]{0,79})\.wake$/;
 
 const CALLBACK_HELPER = `#!/usr/bin/env bash
 set -euo pipefail
@@ -102,8 +103,14 @@ async function ensurePrivateDirectory(directory: string): Promise<void> {
 	await chmodPrivate(directory, 0o700);
 }
 
-export function parseCallbackFileName(fileName: string): { wake: boolean } | undefined {
+export function jobCompletionFileName(jobName: string): string {
+	return `job-completion-${jobName}.wake`;
+}
+
+export function parseCallbackFileName(fileName: string): { wake: boolean; jobName?: string } | undefined {
 	if (fileName.startsWith(".")) return undefined;
+	const jobCompletion = fileName.match(JOB_COMPLETION_FILE_PATTERN);
+	if (jobCompletion?.[1]) return { wake: true, jobName: jobCompletion[1] };
 	if (fileName.endsWith(".wake")) return { wake: true };
 	if (fileName.endsWith(".quiet")) return { wake: false };
 	return undefined;
@@ -144,6 +151,7 @@ export class CallbackStream {
 	#root: string | undefined;
 	#inbox: string | undefined;
 	#scanInProgress = false;
+	readonly #activeJobWaiters = new Map<string, number>();
 
 	constructor(pi: Pick<ExtensionAPI, "appendEntry" | "sendMessage">, options: CallbackStreamOptions = {}) {
 		this.#pi = pi;
@@ -189,11 +197,35 @@ export class CallbackStream {
 		this.#root = undefined;
 		this.#inbox = undefined;
 		this.#scanInProgress = false;
+		this.#activeJobWaiters.clear();
 	}
 
 	bootstrap(): string {
 		if (!this.#root) throw new Error("Callback stream is not initialized");
 		return buildCallbackBootstrap(this.#root);
+	}
+
+	beginJobWait(jobName: string): () => void {
+		this.#activeJobWaiters.set(jobName, (this.#activeJobWaiters.get(jobName) ?? 0) + 1);
+		let released = false;
+		return () => {
+			if (released) return;
+			released = true;
+			const remaining = (this.#activeJobWaiters.get(jobName) ?? 1) - 1;
+			if (remaining > 0) this.#activeJobWaiters.set(jobName, remaining);
+			else this.#activeJobWaiters.delete(jobName);
+		};
+	}
+
+	async acknowledgeJobCompletion(jobName: string): Promise<boolean> {
+		if (!this.#inbox) return false;
+		try {
+			await fsp.rm(path.join(this.#inbox, jobCompletionFileName(jobName)));
+			return true;
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+			throw error;
+		}
 	}
 
 	prompt(): string {
@@ -206,18 +238,33 @@ export class CallbackStream {
 		this.#scanInProgress = true;
 		try {
 			const entries = await fsp.readdir(this.#inbox, { withFileTypes: true });
-			const candidates: Array<{ fileName: string; filePath: string; mtimeMs: number; wake: boolean }> = [];
+			const candidates: Array<{
+				fileName: string;
+				filePath: string;
+				mtimeMs: number;
+				wake: boolean;
+				jobName?: string;
+			}> = [];
 			for (const entry of entries) {
 				if (!entry.isFile()) continue;
 				const parsed = parseCallbackFileName(entry.name);
 				if (!parsed) continue;
 				const filePath = path.join(this.#inbox, entry.name);
 				const stat = await fsp.stat(filePath);
-				candidates.push({ fileName: entry.name, filePath, mtimeMs: stat.mtimeMs, wake: parsed.wake });
+				candidates.push({
+					fileName: entry.name,
+					filePath,
+					mtimeMs: stat.mtimeMs,
+					wake: parsed.wake,
+					jobName: parsed.jobName,
+				});
 			}
 			candidates.sort((left, right) => left.mtimeMs - right.mtimeMs || left.fileName.localeCompare(right.fileName));
+			const deliverable = candidates.filter(
+				(candidate) => !candidate.jobName || !this.#activeJobWaiters.has(candidate.jobName),
+			);
 
-			for (const candidate of candidates.slice(0, MAX_CALLBACKS_PER_SCAN)) {
+			for (const candidate of deliverable.slice(0, MAX_CALLBACKS_PER_SCAN)) {
 				const record = await this.#readRecord(candidate.filePath, candidate.wake);
 				if (!record.wake) {
 					this.#pi.appendEntry<CallbackStatusEntry>("session-callback-status", {
