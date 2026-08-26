@@ -210,14 +210,18 @@ printf '%s\n' running > "$PI_JOB_DIR/state"
 bash -c "$PI_JOB_COMMAND"
 status=$?
 completion_id="job-completion-$PI_JOB_NAME"
+mkdir -p -- "$PI_CALLBACK_DIR/inbox"
 completion_temporary="$PI_CALLBACK_DIR/inbox/.$completion_id-$$.tmp"
 if ((status == 0)); then
   completion_message="Job $PI_JOB_NAME completed successfully."
 else
   completion_message="Job $PI_JOB_NAME exited with status $status."
 fi
-printf '%s' "$completion_message" > "$completion_temporary"
-mv -- "$completion_temporary" "$PI_CALLBACK_DIR/inbox/$completion_id.wake"
+if ! printf '%s' "$completion_message" > "$completion_temporary" ||
+  ! mv -- "$completion_temporary" "$PI_CALLBACK_DIR/inbox/$completion_id.wake"; then
+  printf 'warning: failed to publish automatic completion callback\n' >&2
+  rm -f -- "$completion_temporary"
+fi
 temporary="$PI_JOB_DIR/.exit-code-$$.tmp"
 printf '%s\n' "$status" > "$temporary"
 mv -- "$temporary" "$PI_JOB_DIR/exit-code"
@@ -367,13 +371,13 @@ async function waitForJob(
 }> {
 	const startedAt = Date.now();
 	const deadline = startedAt + timeoutSeconds * 1_000;
-	const releaseWaiter = callbacks.beginJobWait(jobName);
+	const waitRegistration = callbacks.beginJobWait(jobName);
 	try {
 		while (true) {
 			signal?.throwIfAborted();
 			const job = await readJob(jobDirectory);
 			if (isTerminal(job)) {
-				const completionAcknowledged = await callbacks.acknowledgeJobCompletion(jobName);
+				const completionAcknowledged = await waitRegistration.acknowledgeCompletion();
 				return {
 					job,
 					timedOut: false,
@@ -394,7 +398,7 @@ async function waitForJob(
 			await delay(Math.min(remainingMs, 100), undefined, { signal });
 		}
 	} finally {
-		releaseWaiter();
+		waitRegistration.release();
 	}
 }
 
@@ -435,11 +439,27 @@ async function stopJob(jobDirectory: string): Promise<JobSnapshot> {
 function formatJob(job: JobSnapshot): string {
 	const pid = job.pid === undefined ? "" : ` pid=${job.pid}`;
 	const exitCode = job.exitCode === undefined ? "" : ` exit=${job.exitCode}`;
-	return `${job.name}: ${job.status}${pid}${exitCode}\n  cwd: ${job.cwd}\n  log: ${job.logPath}`;
+	return `${job.name}: ${job.status}${pid}${exitCode}\n  ${formatStarted(job.createdAt)}\n  cwd: ${job.cwd}\n  log: ${job.logPath}`;
+}
+
+function formatAge(milliseconds: number): string {
+	if (!Number.isFinite(milliseconds) || milliseconds < 5_000) return "just now";
+	const seconds = Math.floor(milliseconds / 1_000);
+	if (seconds < 60) return `${seconds}s`;
+	const minutes = Math.floor(seconds / 60);
+	if (minutes < 60) return `${minutes}m`;
+	const hours = Math.floor(minutes / 60);
+	if (hours < 24) return `${hours}h`;
+	return `${Math.floor(hours / 24)}d`;
+}
+
+function formatStarted(createdAt: string, now = Date.now()): string {
+	const age = formatAge(now - Date.parse(createdAt));
+	return age === "just now" ? "started just now" : `started ${age} ago`;
 }
 
 function formatCompactJob(job: JobSnapshot): string {
-	const details: string[] = [job.name, job.status];
+	const details: string[] = [job.name, job.status, formatStarted(job.createdAt)];
 	if ((job.status === "running" || job.status === "starting") && job.pid !== undefined) {
 		details.push(`pid ${job.pid}`);
 	}
@@ -448,7 +468,12 @@ function formatCompactJob(job: JobSnapshot): string {
 }
 
 function formatExpandedJob(job: JobSnapshot): string {
-	const details = [formatCompactJob(job), `  cwd: ${job.cwd}`, `  log: ${job.logPath}`];
+	const details = [
+		formatCompactJob(job),
+		`  started: ${job.createdAt} (${formatStarted(job.createdAt)})`,
+		`  cwd: ${job.cwd}`,
+		`  log: ${job.logPath}`,
+	];
 	if (job.endedAt) details.push(`  ended: ${job.endedAt}`);
 	return details.join("\n");
 }
@@ -521,7 +546,9 @@ export function createSessionJobTool(callbacks: CallbackStream, agentDirectory: 
 				);
 				const outcome = result.timedOut
 					? "Wait timed out; job is still active."
-					: "Job reached a terminal state. Completion callback acknowledged when pending.";
+					: result.completionAcknowledged
+						? "Job reached a terminal state. Pending completion callback acknowledged."
+						: "Job reached a terminal state. No pending completion callback was acknowledged.";
 				return {
 					content: [{ type: "text", text: `${outcome}\n${formatJob(result.job)}` }],
 					details: {
@@ -580,7 +607,9 @@ export function createSessionJobTool(callbacks: CallbackStream, agentDirectory: 
 			} else if (job) {
 				const waitResult = action === "wait" ? (waitTimedOut ? " · wait timed out" : " · completion observed") : "";
 				text = options.expanded
-					? `${formatExpandedJob(job)}${waitedMs === undefined ? "" : `\n  waited: ${waitedMs}ms`}`
+					? `${formatExpandedJob(job)}${
+							action === "wait" ? `\n  wait: ${waitTimedOut ? "timed out" : "completion observed"}` : ""
+						}${waitedMs === undefined ? "" : `\n  waited: ${waitedMs}ms`}`
 					: `${formatCompactJob(job)}${waitResult}`;
 			} else {
 				text = fallback;

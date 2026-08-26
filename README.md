@@ -66,6 +66,10 @@ it acknowledges that callback so completion enters agent context only once.
 Timeout or cancellation leaves callback delivery intact. `status` remains the
 side-effect-free snapshot action and is retained for compatibility.
 
+Job summaries include how long ago the job started. Expanded output also shows
+the exact ISO start time. For `wait`, this job age is separate from the time
+spent by that individual wait call.
+
 ### Progress callbacks
 
 Commands started through `session_job` receive `PI_CALLBACK_DIR` and a `pi-callback` helper on `PATH`:
@@ -78,6 +82,10 @@ pi-callback "input data is invalid; intervention required"
 Callbacks wake Pi by default. A successful or failed job automatically emits a
 waking completion callback unless an active `wait` observes and acknowledges
 that completion first.
+
+The callback watcher and concurrent waiters use an atomic filesystem rename to
+claim an automatic completion. This ensures that only one path can consume it,
+including when multiple waits finish together.
 
 `--no-wake` updates are rendered immediately as durable, TUI-only session entries. They are never sent to the agent and cannot trigger a turn. Use a waking callback when information needs the agent's attention or context.
 

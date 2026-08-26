@@ -356,6 +356,106 @@ describe("session_job", () => {
 		callbacks.stop();
 	});
 
+	it("atomically acknowledges one completion across concurrent waiters", async () => {
+		const agentDirectory = await createTemporaryDirectory();
+		const { callbacks, messages } = createCallbackStream();
+		const context = createContext(agentDirectory);
+		await callbacks.start(agentDirectory, "atomic-ack-session", context);
+		const inbox = path.join(agentDirectory, "callbacks", "atomic-ack-session", "inbox");
+		const first = callbacks.beginJobWait("atomic-ack");
+		const second = callbacks.beginJobWait("atomic-ack");
+		await writeFile(path.join(inbox, jobCompletionFileName("atomic-ack")), "finished", "utf8");
+
+		const acknowledgements = await Promise.all([first.acknowledgeCompletion(), second.acknowledgeCompletion()]);
+
+		expect(acknowledgements.filter(Boolean)).toHaveLength(1);
+		first.release();
+		second.release();
+		await new Promise((resolve) => setTimeout(resolve, 75));
+		expect(messages).toHaveLength(0);
+		callbacks.stop();
+	});
+
+	it("arbitrates scanner delivery and waiter acknowledgement exactly once", async () => {
+		const agentDirectory = await createTemporaryDirectory();
+		const { callbacks, messages } = createCallbackStream(10_000);
+		const context = createContext(agentDirectory);
+		await callbacks.start(agentDirectory, "scan-ack-race-session", context);
+		const inbox = path.join(agentDirectory, "callbacks", "scan-ack-race-session", "inbox");
+
+		for (let iteration = 0; iteration < 20; iteration += 1) {
+			const jobName = `scan-ack-${iteration}`;
+			const messageCountBefore = messages.length;
+			await writeFile(path.join(inbox, jobCompletionFileName(jobName)), `finished ${iteration}`, "utf8");
+			const [, acknowledged] = await Promise.all([
+				callbacks.scan(context),
+				callbacks.acknowledgeJobCompletion(jobName),
+			]);
+			await waitFor(() => messages.length > messageCountBefore || acknowledged);
+			expect(messages.length - messageCountBefore + Number(acknowledged)).toBe(1);
+		}
+
+		callbacks.stop();
+	});
+
+	it("rescans a deferred completion as soon as the final waiter releases", async () => {
+		const agentDirectory = await createTemporaryDirectory();
+		const { callbacks, messages } = createCallbackStream(10_000);
+		const context = createContext(agentDirectory);
+		await callbacks.start(agentDirectory, "release-rescan-session", context);
+		const inbox = path.join(agentDirectory, "callbacks", "release-rescan-session", "inbox");
+		const registration = callbacks.beginJobWait("release-rescan");
+		await writeFile(
+			path.join(inbox, jobCompletionFileName("release-rescan")),
+			"Job release-rescan completed successfully.",
+			"utf8",
+		);
+
+		await new Promise((resolve) => setTimeout(resolve, 75));
+		expect(messages).toHaveLength(0);
+		registration.release();
+		await waitFor(() => messages.length === 1);
+		expect(messages[0]?.message.content).toBe("Job release-rescan completed successfully.");
+		callbacks.stop();
+	});
+
+	it("delivers unrelated callbacks while a job completion is deferred", async () => {
+		const agentDirectory = await createTemporaryDirectory();
+		const { callbacks, messages } = createCallbackStream();
+		const context = createContext(agentDirectory);
+		await callbacks.start(agentDirectory, "manual-during-wait-session", context);
+		const inbox = path.join(agentDirectory, "callbacks", "manual-during-wait-session", "inbox");
+		const registration = callbacks.beginJobWait("deferred-job");
+		await writeFile(path.join(inbox, jobCompletionFileName("deferred-job")), "automatic completion", "utf8");
+		await writeFile(path.join(inbox, "manual.wake"), "manual progress", "utf8");
+
+		await waitFor(() => messages.length === 1);
+		expect(messages[0]?.message.content).toBe("manual progress");
+		expect(await registration.acknowledgeCompletion()).toBe(true);
+		registration.release();
+		await new Promise((resolve) => setTimeout(resolve, 75));
+		expect(messages).toHaveLength(1);
+		callbacks.stop();
+	});
+
+	it("preserves active completion deferral across a callback stream restart", async () => {
+		const agentDirectory = await createTemporaryDirectory();
+		const { callbacks, messages } = createCallbackStream();
+		const context = createContext(agentDirectory);
+		await callbacks.start(agentDirectory, "active-restart-session", context);
+		const registration = callbacks.beginJobWait("active-restart");
+		callbacks.stop();
+		await callbacks.start(agentDirectory, "active-restart-session", context);
+		const inbox = path.join(agentDirectory, "callbacks", "active-restart-session", "inbox");
+		await writeFile(path.join(inbox, jobCompletionFileName("active-restart")), "finished", "utf8");
+
+		await new Promise((resolve) => setTimeout(resolve, 75));
+		expect(messages).toHaveLength(0);
+		expect(await registration.acknowledgeCompletion()).toBe(true);
+		registration.release();
+		callbacks.stop();
+	});
+
 	it("releases callback delivery when wait is cancelled", async () => {
 		const agentDirectory = await createTemporaryDirectory();
 		const workspace = await createTemporaryDirectory();
@@ -424,11 +524,12 @@ describe("session_job", () => {
 	it("renders compact action-aware calls and results", () => {
 		const { callbacks } = createCallbackStream();
 		const tool = createSessionJobTool(callbacks, "/agent");
+		const createdAt = new Date(Date.now() - 65_000).toISOString();
 		const job = {
 			name: "training",
 			command: "train",
 			cwd: "/workspace",
-			createdAt: "2026-07-22T00:00:00.000Z",
+			createdAt,
 			pid: 123,
 			status: "succeeded" as const,
 			exitCode: 0,
@@ -454,7 +555,7 @@ describe("session_job", () => {
 			{ cwd: "/workspace", toolCallId: "result-render", args: { action: "status", name: "training" } } as never,
 		);
 		const collapsedText = renderedText(collapsed);
-		expect(collapsedText).toBe("training · succeeded · exit 0");
+		expect(collapsedText).toBe("training · succeeded · started 1m ago · exit 0");
 		expect(collapsedText).not.toContain("/workspace");
 
 		const expanded = tool.renderResult?.(
@@ -466,6 +567,7 @@ describe("session_job", () => {
 		const expandedText = renderedText(expanded);
 		expect(expandedText).toContain("cwd: /workspace");
 		expect(expandedText).toContain("log: /callbacks/jobs/training/job.log");
+		expect(expandedText).toContain(`started: ${createdAt} (started 1m ago)`);
 	});
 
 	it("shows the submitted Bash command in the start call", () => {
@@ -498,7 +600,7 @@ describe("session_job", () => {
 					name: "training",
 					command: "train",
 					cwd: "/workspace",
-					createdAt: "2026-07-22T00:00:00.000Z",
+					createdAt: new Date(Date.now() - 65_000).toISOString(),
 					pid: 123,
 					status: "running" as const,
 					logPath: "/callbacks/jobs/training/job.log",
@@ -513,7 +615,7 @@ describe("session_job", () => {
 			identityTheme as never,
 			{ cwd: "/workspace", toolCallId: "wait-render", args: { action: "wait", name: "training" } } as never,
 		);
-		expect(renderedText(component)).toBe("training · running · pid 123 · wait timed out");
+		expect(renderedText(component)).toBe("training · running · started 1m ago · pid 123 · wait timed out");
 	});
 
 	it("renders log output without repeating job metadata when collapsed", () => {
@@ -586,6 +688,28 @@ describe("session_job", () => {
 		expect(logPath).toBeDefined();
 		if (!logPath) throw new Error("job did not return a log path");
 		expect(await readFile(logPath, "utf8")).toContain("first\nlast\n");
+		callbacks.stop();
+	});
+
+	it("recreates a missing callback inbox before publishing job completion", async () => {
+		const agentDirectory = await createTemporaryDirectory();
+		const workspace = await createTemporaryDirectory();
+		const { callbacks, messages } = createCallbackStream();
+		const context = createContext(workspace);
+		await callbacks.start(agentDirectory, "recreate-inbox-session", context);
+		const tool = createSessionJobTool(callbacks, agentDirectory);
+		await tool.execute(
+			"start-recreate-inbox",
+			{ action: "start", name: "recreate-inbox", command: "sleep 0.15" },
+			undefined,
+			undefined,
+			context,
+		);
+		const inbox = path.join(agentDirectory, "callbacks", "recreate-inbox-session", "inbox");
+		await rm(inbox, { recursive: true, force: true });
+
+		await waitFor(() => messages.length === 1);
+		expect(messages[0]?.message.content).toBe("Job recreate-inbox completed successfully.");
 		callbacks.stop();
 	});
 

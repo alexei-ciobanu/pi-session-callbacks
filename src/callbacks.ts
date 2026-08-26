@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as fsp from "node:fs/promises";
 import * as path from "node:path";
@@ -7,6 +8,7 @@ const MAX_CALLBACK_BYTES = 16 * 1024;
 const MAX_MESSAGE_CHARS = 12 * 1024;
 const MAX_CALLBACKS_PER_SCAN = 100;
 const DEFAULT_RESCAN_INTERVAL_MS = 2_000;
+const JOB_NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,79}$/;
 const JOB_COMPLETION_FILE_PATTERN = /^job-completion-([A-Za-z0-9][A-Za-z0-9_.-]{0,79})\.wake$/;
 
 const CALLBACK_HELPER = `#!/usr/bin/env bash
@@ -81,6 +83,11 @@ export type WakingCallbackDetails = {
 	wakingMessage: string;
 };
 
+export type JobWaitRegistration = {
+	acknowledgeCompletion(): Promise<boolean>;
+	release(): void;
+};
+
 type CallbackStreamOptions = {
 	rescanIntervalMs?: number;
 };
@@ -104,6 +111,7 @@ async function ensurePrivateDirectory(directory: string): Promise<void> {
 }
 
 export function jobCompletionFileName(jobName: string): string {
+	if (!JOB_NAME_PATTERN.test(jobName)) throw new Error(`invalid job name: ${jobName}`);
 	return `job-completion-${jobName}.wake`;
 }
 
@@ -150,7 +158,10 @@ export class CallbackStream {
 	#rescanTimer: NodeJS.Timeout | undefined;
 	#root: string | undefined;
 	#inbox: string | undefined;
-	#scanInProgress = false;
+	#ctx: ExtensionContext | undefined;
+	#generation = 0;
+	readonly #scansInProgress = new Set<number>();
+	readonly #scanRequested = new Set<number>();
 	readonly #activeJobWaiters = new Map<string, number>();
 
 	constructor(pi: Pick<ExtensionAPI, "appendEntry" | "sendMessage">, options: CallbackStreamOptions = {}) {
@@ -170,6 +181,7 @@ export class CallbackStream {
 		this.stop();
 		this.#root = path.join(agentDirectory, "callbacks", sessionId);
 		this.#inbox = path.join(this.#root, "inbox");
+		this.#ctx = ctx;
 		const binDirectory = path.join(this.#root, "bin");
 		await Promise.all([
 			ensurePrivateDirectory(this.#inbox),
@@ -196,8 +208,9 @@ export class CallbackStream {
 		this.#rescanTimer = undefined;
 		this.#root = undefined;
 		this.#inbox = undefined;
-		this.#scanInProgress = false;
-		this.#activeJobWaiters.clear();
+		this.#ctx = undefined;
+		this.#generation += 1;
+		this.#scanRequested.clear();
 	}
 
 	bootstrap(): string {
@@ -205,25 +218,64 @@ export class CallbackStream {
 		return buildCallbackBootstrap(this.#root);
 	}
 
-	beginJobWait(jobName: string): () => void {
-		this.#activeJobWaiters.set(jobName, (this.#activeJobWaiters.get(jobName) ?? 0) + 1);
+	beginJobWait(jobName: string): JobWaitRegistration {
+		const inbox = this.#inbox;
+		if (!inbox) throw new Error("Callback stream is not initialized");
+		const waiterKey = this.#jobWaiterKey(inbox, jobName);
+		this.#activeJobWaiters.set(waiterKey, (this.#activeJobWaiters.get(waiterKey) ?? 0) + 1);
 		let released = false;
-		return () => {
-			if (released) return;
-			released = true;
-			const remaining = (this.#activeJobWaiters.get(jobName) ?? 1) - 1;
-			if (remaining > 0) this.#activeJobWaiters.set(jobName, remaining);
-			else this.#activeJobWaiters.delete(jobName);
+		return {
+			acknowledgeCompletion: () => this.#acknowledgeJobCompletion(inbox, jobName),
+			release: () => {
+				if (released) return;
+				released = true;
+				const remaining = (this.#activeJobWaiters.get(waiterKey) ?? 1) - 1;
+				if (remaining > 0) {
+					this.#activeJobWaiters.set(waiterKey, remaining);
+					return;
+				}
+				this.#activeJobWaiters.delete(waiterKey);
+				if (this.#inbox === inbox && this.#ctx) void this.scan(this.#ctx);
+			},
 		};
 	}
 
 	async acknowledgeJobCompletion(jobName: string): Promise<boolean> {
 		if (!this.#inbox) return false;
+		return this.#acknowledgeJobCompletion(this.#inbox, jobName);
+	}
+
+	async #acknowledgeJobCompletion(inbox: string, jobName: string): Promise<boolean> {
 		try {
-			await fsp.rm(path.join(this.#inbox, jobCompletionFileName(jobName)));
+			const claimedPath = await this.#claimJobCompletion(inbox, jobName);
+			if (!claimedPath) return false;
+			await fsp.rm(claimedPath, { force: true }).catch(() => {});
 			return true;
+		} catch {
+			// Acknowledgement is best-effort. The terminal job snapshot remains useful,
+			// and an unclaimed callback can still be delivered by the watcher.
+			return false;
+		}
+	}
+
+	#jobWaiterKey(inbox: string, jobName: string): string {
+		return `${inbox}\0${jobName}`;
+	}
+
+	#hasActiveJobWaiter(inbox: string, jobName: string): boolean {
+		return this.#activeJobWaiters.has(this.#jobWaiterKey(inbox, jobName));
+	}
+
+	async #claimJobCompletion(inbox: string, jobName: string): Promise<string | undefined> {
+		const sourcePath = path.join(inbox, jobCompletionFileName(jobName));
+		const claimedPath = path.join(inbox, `.${jobCompletionFileName(jobName)}.claimed-${process.pid}-${randomUUID()}`);
+		try {
+			// Rename is the ownership boundary shared by the watcher and waiters. Unlike
+			// fs.rm(), exactly one concurrent caller can move the source path.
+			await fsp.rename(sourcePath, claimedPath);
+			return claimedPath;
 		} catch (error) {
-			if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
 			throw error;
 		}
 	}
@@ -234,10 +286,16 @@ export class CallbackStream {
 	}
 
 	async scan(ctx: ExtensionContext): Promise<void> {
-		if (!this.#inbox || this.#scanInProgress) return;
-		this.#scanInProgress = true;
+		if (!this.#inbox) return;
+		const generation = this.#generation;
+		if (this.#scansInProgress.has(generation)) {
+			this.#scanRequested.add(generation);
+			return;
+		}
+		this.#scansInProgress.add(generation);
+		const inbox = this.#inbox;
 		try {
-			const entries = await fsp.readdir(this.#inbox, { withFileTypes: true });
+			const entries = await fsp.readdir(inbox, { withFileTypes: true });
 			const candidates: Array<{
 				fileName: string;
 				filePath: string;
@@ -249,8 +307,14 @@ export class CallbackStream {
 				if (!entry.isFile()) continue;
 				const parsed = parseCallbackFileName(entry.name);
 				if (!parsed) continue;
-				const filePath = path.join(this.#inbox, entry.name);
-				const stat = await fsp.stat(filePath);
+				const filePath = path.join(inbox, entry.name);
+				let stat: Awaited<ReturnType<typeof fsp.stat>>;
+				try {
+					stat = await fsp.stat(filePath);
+				} catch (error) {
+					if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+					throw error;
+				}
 				candidates.push({
 					fileName: entry.name,
 					filePath,
@@ -261,34 +325,53 @@ export class CallbackStream {
 			}
 			candidates.sort((left, right) => left.mtimeMs - right.mtimeMs || left.fileName.localeCompare(right.fileName));
 			const deliverable = candidates.filter(
-				(candidate) => !candidate.jobName || !this.#activeJobWaiters.has(candidate.jobName),
+				(candidate) => !candidate.jobName || !this.#hasActiveJobWaiter(inbox, candidate.jobName),
 			);
 
-			for (const candidate of deliverable.slice(0, MAX_CALLBACKS_PER_SCAN)) {
-				const record = await this.#readRecord(candidate.filePath, candidate.wake);
-				if (!record.wake) {
-					this.#pi.appendEntry<CallbackStatusEntry>("session-callback-status", {
-						message: record.message,
-						sourcePath: candidate.filePath,
-						timestamp: new Date(candidate.mtimeMs).toISOString(),
-					});
-					await fsp.rm(candidate.filePath, { force: true });
-					continue;
+			let deliveredCount = 0;
+			for (const candidate of deliverable) {
+				if (generation !== this.#generation) return;
+				if (deliveredCount >= MAX_CALLBACKS_PER_SCAN) break;
+				if (candidate.jobName && this.#hasActiveJobWaiter(inbox, candidate.jobName)) continue;
+
+				let readPath = candidate.filePath;
+				if (candidate.jobName) {
+					const claimedPath = await this.#claimJobCompletion(inbox, candidate.jobName);
+					if (!claimedPath) continue;
+					readPath = claimedPath;
 				}
 
-				this.#deliverWake(record);
-				await fsp.rm(candidate.filePath, { force: true });
+				try {
+					const record = await this.#readRecord(readPath, candidate.wake, candidate.filePath);
+					if (!record.wake) {
+						this.#pi.appendEntry<CallbackStatusEntry>("session-callback-status", {
+							message: record.message,
+							sourcePath: candidate.filePath,
+							timestamp: new Date(candidate.mtimeMs).toISOString(),
+						});
+					} else {
+						this.#deliverWake(record);
+					}
+					await fsp.rm(readPath, { force: true });
+					deliveredCount += 1;
+				} catch (error) {
+					if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+					throw error;
+				}
 			}
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);
 			if (ctx.hasUI) ctx.ui.notify(`Callback watcher error: ${message}`, "warning");
 		} finally {
-			this.#scanInProgress = false;
+			this.#scansInProgress.delete(generation);
+			if (this.#scanRequested.delete(generation) && generation === this.#generation) {
+				void this.scan(this.#ctx ?? ctx);
+			}
 		}
 	}
 
-	async #readRecord(sourcePath: string, wake: boolean): Promise<CallbackRecord> {
-		const stat = await fsp.stat(sourcePath);
+	async #readRecord(readPath: string, wake: boolean, sourcePath = readPath): Promise<CallbackRecord> {
+		const stat = await fsp.stat(readPath);
 		if (stat.size > MAX_CALLBACK_BYTES) {
 			return {
 				message: `Ignored a callback message over ${MAX_CALLBACK_BYTES} bytes.`,
@@ -296,7 +379,7 @@ export class CallbackStream {
 				sourcePath,
 			};
 		}
-		const message = trimForContext(await fsp.readFile(sourcePath, "utf8"));
+		const message = trimForContext(await fsp.readFile(readPath, "utf8"));
 		return { message, wake, sourcePath };
 	}
 
