@@ -2,7 +2,7 @@ import { mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { DEFAULT_MAX_BYTES } from "@earendil-works/pi-coding-agent";
+import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES } from "@earendil-works/pi-coding-agent";
 import { afterEach, describe, expect, it } from "vitest";
 import {
 	buildCallbackBootstrap,
@@ -173,6 +173,16 @@ describe("session_job", () => {
 		expect(output).toMatch(/final line$/);
 	});
 
+	it("omits an incomplete trailing UTF-8 sequence from a live log read", async () => {
+		const directory = await createTemporaryDirectory();
+		const logPath = path.join(directory, "job.log");
+		await writeFile(logPath, Buffer.from([0x6f, 0x6b, 0x20, 0xf0, 0x9f]));
+
+		const output = await readLogTail(logPath, 1);
+		expect(output).toBe("ok");
+		expect(output).not.toContain("�");
+	});
+
 	it("returns an empty-log placeholder", async () => {
 		const directory = await createTemporaryDirectory();
 		const logPath = path.join(directory, "job.log");
@@ -294,6 +304,22 @@ describe("session_job", () => {
 		expect(text).toContain("[Log truncated; showing the tail only]");
 		expect(text).not.toContain("�");
 		expect(text).toMatch(/final line$/);
+
+		await writeFile(
+			logPath,
+			Array.from({ length: DEFAULT_MAX_LINES }, (_, index) => `line ${index + 1}`).join("\n"),
+			"utf8",
+		);
+		const lineBoundResult = await tool.execute(
+			"status-line-bound",
+			{ action: "status", name: "status-large-tail", lines: DEFAULT_MAX_LINES },
+			undefined,
+			undefined,
+			context,
+		);
+		const lineBoundText = lineBoundResult.content[0]?.type === "text" ? lineBoundResult.content[0].text : "";
+		expect(lineBoundText.split("\n").length).toBeLessThanOrEqual(DEFAULT_MAX_LINES);
+		expect(lineBoundText).toMatch(/line 2000$/);
 
 		await tool.execute(
 			"stop-status-large-tail",

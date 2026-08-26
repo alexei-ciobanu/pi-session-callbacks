@@ -319,6 +319,27 @@ function removeLeadingUtf8ContinuationBytes(buffer: Buffer): Buffer {
 	return buffer.subarray(offset);
 }
 
+function removeTrailingIncompleteUtf8Bytes(buffer: Buffer): Buffer {
+	if (buffer.length === 0) return buffer;
+	let sequenceStart = buffer.length - 1;
+	while (sequenceStart >= 0 && (buffer[sequenceStart] & 0xc0) === 0x80) sequenceStart -= 1;
+	if (sequenceStart < 0) return buffer.subarray(0, 0);
+
+	const leadingByte = buffer[sequenceStart];
+	const expectedLength =
+		leadingByte <= 0x7f
+			? 1
+			: leadingByte >= 0xc2 && leadingByte <= 0xdf
+				? 2
+				: leadingByte >= 0xe0 && leadingByte <= 0xef
+					? 3
+					: leadingByte >= 0xf0 && leadingByte <= 0xf4
+						? 4
+						: undefined;
+	if (expectedLength === undefined || buffer.length - sequenceStart >= expectedLength) return buffer;
+	return buffer.subarray(0, sequenceStart);
+}
+
 export async function readLogTail(logPath: string, lines: number, maxBytes = DEFAULT_MAX_BYTES): Promise<string> {
 	const handle = await fsp.open(logPath, "r");
 	try {
@@ -329,7 +350,9 @@ export async function readLogTail(logPath: string, lines: number, maxBytes = DEF
 		const length = Math.min(stat.size, contentByteLimit + 4);
 		const buffer = Buffer.alloc(length);
 		const { bytesRead } = await handle.read(buffer, 0, length, stat.size - length);
-		const chunk = removeLeadingUtf8ContinuationBytes(buffer.subarray(0, bytesRead));
+		const chunk = removeTrailingIncompleteUtf8Bytes(
+			removeLeadingUtf8ContinuationBytes(buffer.subarray(0, bytesRead)),
+		);
 		const truncation = truncateTail(chunk.toString("utf8"), {
 			maxBytes: contentByteLimit,
 			maxLines: lines,
@@ -365,7 +388,7 @@ async function waitForJob(
 	timeoutSeconds: number,
 	signal: AbortSignal | undefined,
 	callbacks: CallbackStream,
-	onProgress?: (job: JobSnapshot, waitedMs: number) => Promise<void>,
+	onProgress?: (job: JobSnapshot, waitedMs: number) => void,
 ): Promise<{
 	job: JobSnapshot;
 	timedOut: boolean;
@@ -376,11 +399,24 @@ async function waitForJob(
 	const deadline = startedAt + timeoutSeconds * 1_000;
 	const waitRegistration = callbacks.beginJobWait(jobName);
 	let nextProgressAt = startedAt;
+	let firstObservation = true;
 	try {
 		while (true) {
 			signal?.throwIfAborted();
 			const job = await readJob(jobDirectory);
+			const observedAt = Date.now();
 			if (isTerminal(job)) {
+				const endedAt = job.endedAt ? Date.parse(job.endedAt) : Number.NaN;
+				const completedWithinDeadline =
+					firstObservation || observedAt <= deadline || (Number.isFinite(endedAt) && endedAt <= deadline);
+				if (!completedWithinDeadline) {
+					return {
+						job,
+						timedOut: true,
+						waitedMs: observedAt - startedAt,
+						completionAcknowledged: false,
+					};
+				}
 				const completionAcknowledged = await waitRegistration.acknowledgeCompletion();
 				return {
 					job,
@@ -390,19 +426,19 @@ async function waitForJob(
 				};
 			}
 
-			const now = Date.now();
-			const remainingMs = deadline - now;
+			firstObservation = false;
+			const remainingMs = deadline - observedAt;
 			if (remainingMs <= 0) {
 				return {
 					job,
 					timedOut: true,
-					waitedMs: Date.now() - startedAt,
+					waitedMs: observedAt - startedAt,
 					completionAcknowledged: false,
 				};
 			}
-			if (onProgress && now >= nextProgressAt) {
-				await onProgress(job, now - startedAt);
-				nextProgressAt = now + WAIT_PROGRESS_POLL_MS;
+			if (onProgress && observedAt >= nextProgressAt) {
+				onProgress(job, observedAt - startedAt);
+				nextProgressAt = observedAt + WAIT_PROGRESS_POLL_MS;
 			}
 			await delay(Math.min(remainingMs, 100), undefined, { signal });
 		}
@@ -418,12 +454,16 @@ async function withOptionalLogTail(
 ): Promise<{ text: string; logText?: string }> {
 	if (lines === undefined) return { text: baseText };
 	const separator = "\n\nRecent output:\n";
+	const metadataLines = `${baseText}${separator}`.split("\n").length - 1;
+	const availableLogLines = Math.max(1, DEFAULT_MAX_LINES - metadataLines);
 	const availableLogBytes = Math.max(
 		1,
 		DEFAULT_MAX_BYTES - Buffer.byteLength(baseText) - Buffer.byteLength(separator),
 	);
-	const logText = await readLogTail(job.logPath, lines, availableLogBytes);
-	return { text: `${baseText}${separator}${logText}`, logText };
+	const logText = await readLogTail(job.logPath, Math.min(lines, availableLogLines), availableLogBytes);
+	const combined = `${baseText}${separator}${logText}`;
+	const bounded = truncateTail(combined, { maxBytes: DEFAULT_MAX_BYTES, maxLines: DEFAULT_MAX_LINES });
+	return { text: bounded.content, logText };
 }
 
 function waitProgressSignature(job: JobSnapshot, waitedMs: number, logText: string | undefined): string {
@@ -569,16 +609,16 @@ export function createSessionJobTool(callbacks: CallbackStream, agentDirectory: 
 			}
 			if (normalized.action === "wait") {
 				let lastProgressSignature: string | undefined;
-				const result = await waitForJob(
-					jobDirectory,
-					name,
-					normalized.timeoutSeconds ?? DEFAULT_WAIT_SECONDS,
-					signal,
-					callbacks,
-					onUpdate
-						? async (job, waitedMs) => {
+				let progressActive = true;
+				let progressInFlight = false;
+				const publishProgress = onUpdate
+					? (job: JobSnapshot, waitedMs: number) => {
+							if (progressInFlight) return;
+							progressInFlight = true;
+							void (async () => {
 								const baseText = `Wait in progress.\n${formatJob(job)}`;
 								const output = await withOptionalLogTail(baseText, job, normalized.lines);
+								if (!progressActive || signal?.aborted) return;
 								const signature = waitProgressSignature(job, waitedMs, output.logText);
 								if (signature === lastProgressSignature) return;
 								lastProgressSignature = signature;
@@ -591,11 +631,32 @@ export function createSessionJobTool(callbacks: CallbackStream, agentDirectory: 
 										logText: output.logText,
 									},
 								});
-							}
-						: undefined,
-				);
+							})()
+								.catch(() => {
+									// Partial progress is best-effort and must not change wait semantics.
+								})
+								.finally(() => {
+									progressInFlight = false;
+								});
+						}
+					: undefined;
+				let result: Awaited<ReturnType<typeof waitForJob>>;
+				try {
+					result = await waitForJob(
+						jobDirectory,
+						name,
+						normalized.timeoutSeconds ?? DEFAULT_WAIT_SECONDS,
+						signal,
+						callbacks,
+						publishProgress,
+					);
+				} finally {
+					progressActive = false;
+				}
 				const outcome = result.timedOut
-					? "Wait timed out; job is still active."
+					? isTerminal(result.job)
+						? "Wait timed out before completion was observed."
+						: "Wait timed out; job is still active."
 					: result.completionAcknowledged
 						? "Job reached a terminal state. Pending completion callback acknowledged."
 						: "Job reached a terminal state. No pending completion callback was acknowledged.";
