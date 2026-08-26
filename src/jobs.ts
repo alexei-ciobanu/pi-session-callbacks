@@ -2,14 +2,22 @@ import { spawn } from "node:child_process";
 import * as fsp from "node:fs/promises";
 import * as path from "node:path";
 import { StringEnum } from "@earendil-works/pi-ai";
-import { defineTool, getShellConfig, SettingsManager, type ToolDefinition } from "@earendil-works/pi-coding-agent";
+import {
+	DEFAULT_MAX_BYTES,
+	DEFAULT_MAX_LINES,
+	defineTool,
+	getShellConfig,
+	SettingsManager,
+	type ToolDefinition,
+	truncateTail,
+} from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import type { CallbackStream } from "./callbacks.js";
 
 const JOB_NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,79}$/;
-const MAX_LOG_READ_BYTES = 256 * 1024;
 const DEFAULT_LOG_LINES = 200;
+const LOG_TRUNCATION_NOTICE_BYTES = 128;
 
 const SESSION_JOB_PARAMETERS = Type.Object({
 	action: StringEnum(["start", "list", "status", "logs", "stop"] as const, {
@@ -19,7 +27,11 @@ const SESSION_JOB_PARAMETERS = Type.Object({
 	command: Type.Optional(Type.String({ description: "Bash command to run for a new job" })),
 	cwd: Type.Optional(Type.String({ description: "Working directory, resolved relative to Pi's cwd" })),
 	lines: Type.Optional(
-		Type.Integer({ description: "Number of trailing log lines to return", minimum: 1, maximum: 2_000 }),
+		Type.Integer({
+			description: "Number of trailing log lines to return",
+			minimum: 1,
+			maximum: DEFAULT_MAX_LINES,
+		}),
 	),
 });
 
@@ -277,21 +289,34 @@ async function startJob(
 	return { ...metadata, status: "running", logPath };
 }
 
-async function readLogTail(logPath: string, lines: number): Promise<string> {
+function removeLeadingUtf8ContinuationBytes(buffer: Buffer): Buffer {
+	let offset = 0;
+	while (offset < buffer.length && (buffer[offset] & 0xc0) === 0x80) offset += 1;
+	return buffer.subarray(offset);
+}
+
+export async function readLogTail(logPath: string, lines: number, maxBytes = DEFAULT_MAX_BYTES): Promise<string> {
 	const handle = await fsp.open(logPath, "r");
 	try {
 		const stat = await handle.stat();
-		const length = Math.min(stat.size, MAX_LOG_READ_BYTES);
+		if (stat.size === 0) return "(no output yet)";
+
+		const contentByteLimit = Math.max(1, maxBytes - LOG_TRUNCATION_NOTICE_BYTES);
+		const length = Math.min(stat.size, contentByteLimit + 4);
 		const buffer = Buffer.alloc(length);
-		await handle.read(buffer, 0, length, stat.size - length);
-		const text = buffer.toString("utf8");
-		const selected = text
-			.split(/\r?\n/)
-			.slice(-lines - 1)
-			.join("\n")
-			.trimEnd();
-		const prefix = stat.size > length ? `[Showing the last ${length} bytes]\n` : "";
-		return `${prefix}${selected}` || "(no output yet)";
+		const { bytesRead } = await handle.read(buffer, 0, length, stat.size - length);
+		const chunk = removeLeadingUtf8ContinuationBytes(buffer.subarray(0, bytesRead));
+		const truncation = truncateTail(chunk.toString("utf8"), {
+			maxBytes: contentByteLimit,
+			maxLines: lines,
+		});
+		const selected = truncation.content.trimEnd();
+		if (!selected) return "(no output yet)";
+
+		const truncatedBeforeChunk = stat.size > length;
+		const notice =
+			truncatedBeforeChunk || truncation.truncatedBy === "bytes" ? "[Log truncated; showing the tail only]\n" : "";
+		return `${notice}${selected}`;
 	} finally {
 		await handle.close();
 	}
@@ -419,9 +444,11 @@ export function createSessionJobTool(callbacks: CallbackStream, agentDirectory: 
 			}
 			if (normalized.action === "logs") {
 				const job = await readJob(jobDirectory);
-				const text = await readLogTail(job.logPath, normalized.lines ?? DEFAULT_LOG_LINES);
+				const header = `${formatJob(job)}\n\n`;
+				const availableLogBytes = Math.max(1, DEFAULT_MAX_BYTES - Buffer.byteLength(header));
+				const text = await readLogTail(job.logPath, normalized.lines ?? DEFAULT_LOG_LINES, availableLogBytes);
 				return {
-					content: [{ type: "text", text: `${formatJob(job)}\n\n${text}` }],
+					content: [{ type: "text", text: `${header}${text}` }],
 					details: { action: normalized.action, job, logPath: job.logPath, logText: text },
 				};
 			}

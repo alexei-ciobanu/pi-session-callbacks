@@ -54,6 +54,10 @@ Example tool input:
 
 Explicit names may contain alphanumerics, `.`, `_`, and `-`, and cannot be reused within the same Pi session. If `name` is omitted, the extension creates one.
 
+`logs` returns at most 2,000 lines and 50KB to the agent, whichever limit is
+reached first. The complete durable log remains available at the path shown by
+expanded tool output.
+
 ### Progress callbacks
 
 Commands started through `session_job` receive `PI_CALLBACK_DIR` and a `pi-callback` helper on `PATH`:
