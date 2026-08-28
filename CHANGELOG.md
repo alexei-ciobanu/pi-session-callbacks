@@ -13,6 +13,7 @@
 - Show relative job start age in status, wait, list, start, logs, and stop summaries.
 - Allow `status` and `wait` to include an opt-in bounded log tail through the existing `lines` parameter.
 - Render throttled live job state, wait duration, and requested log tails while `session_job wait` is active.
+- Paginate `session_job list` with a 10-job default, configurable limit/offset, active-first ordering, range hints, and temporary-file overflow for oversized requested pages.
 
 ### Fixed
 
