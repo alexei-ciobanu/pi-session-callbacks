@@ -36,7 +36,7 @@ The extension registers one LLM-callable tool with six actions:
 | Action | Required fields | Purpose |
 |---|---|---|
 | `start` | `command` | Start a detached Bash command |
-| `list` | none | List jobs belonging to the current Pi session |
+| `list` | none | List jobs belonging to the current Pi session with limit/offset pagination |
 | `status` | `name` | Inspect one job |
 | `wait` | `name` | Wait up to a bounded timeout for one job |
 | `logs` | `name` | Read the tail of its durable log |
@@ -54,6 +54,28 @@ Example tool input:
 ```
 
 Explicit names may contain alphanumerics, `.`, `_`, and `-`, and cannot be reused within the same Pi session. If `name` is omitted, the extension creates one.
+
+`list` returns 10 jobs by default. It accepts `limit` from 1 to 1,000 and a
+zero-based `offset`, reports the displayed range and total, and provides the
+next offset when another page exists. Running and starting jobs appear first;
+terminal jobs follow from newest to oldest. Each group uses job creation time
+and then name for deterministic ordering. Pagination does not remove retained
+jobs. Each page is a fresh snapshot, so jobs changing state between calls can
+shift later offsets.
+
+```json
+{ "action": "list", "limit": 1000, "offset": 1000 }
+```
+
+A requested list page is bounded to 2,000 lines and 50KB. If it exceeds either
+limit, the displayed result is truncated from the end and the complete page is
+written to the temporary file named in the result. Use subsequent offsets to
+inspect sessions containing more than 1,000 jobs. Before writing another
+overflow page, the extension removes its own temporary list directories older
+than 24 hours on a best-effort basis; normal operating-system temporary-file
+cleanup still applies. Control characters are escaped when displaying the
+path; if an extraordinary path cannot fit safely, its display is shortened
+while the exact value remains in tool-result details.
 
 `logs` returns at most 2,000 lines and 50KB to the agent, whichever limit is
 reached first. The complete durable log remains available at the path shown by

@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
-import { constants as fsConstants } from "node:fs";
+import { type Dirent, constants as fsConstants } from "node:fs";
 import * as fsp from "node:fs/promises";
+import os from "node:os";
 import * as path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { StringEnum } from "@earendil-works/pi-ai";
@@ -8,10 +9,14 @@ import {
 	DEFAULT_MAX_BYTES,
 	DEFAULT_MAX_LINES,
 	defineTool,
+	formatSize,
 	getShellConfig,
 	SettingsManager,
 	type ToolDefinition,
+	type TruncationResult,
+	truncateHead,
 	truncateTail,
+	withFileMutationQueue,
 } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
@@ -24,6 +29,11 @@ const DEFAULT_WAIT_SECONDS = 30;
 const MAX_WAIT_SECONDS = 3_600;
 const WAIT_PROGRESS_POLL_MS = 500;
 const WAIT_PROGRESS_HEARTBEAT_MS = 5_000;
+export const DEFAULT_JOB_LIST_LIMIT = 10;
+export const MAX_JOB_LIST_LIMIT = 1_000;
+export const JOB_LIST_OUTPUT_TTL_MS = 24 * 60 * 60 * 1_000;
+const JOB_LIST_TEMPORARY_PREFIX = "pi-session-job-list-";
+const MAX_LIST_PATH_DISPLAY_BYTES = DEFAULT_MAX_BYTES - 4 * 1_024;
 
 const SESSION_JOB_PARAMETERS = Type.Object({
 	action: StringEnum(["start", "list", "status", "wait", "logs", "stop"] as const, {
@@ -46,6 +56,20 @@ const SESSION_JOB_PARAMETERS = Type.Object({
 			maximum: MAX_WAIT_SECONDS,
 		}),
 	),
+	limit: Type.Optional(
+		Type.Integer({
+			description: `Maximum jobs to return for list (default ${DEFAULT_JOB_LIST_LIMIT})`,
+			minimum: 1,
+			maximum: MAX_JOB_LIST_LIMIT,
+		}),
+	),
+	offset: Type.Optional(
+		Type.Integer({
+			description: "Number of ordered jobs to skip for list (default 0)",
+			minimum: 0,
+			maximum: Number.MAX_SAFE_INTEGER,
+		}),
+	),
 });
 
 type SessionJobParams = {
@@ -55,6 +79,8 @@ type SessionJobParams = {
 	cwd?: string;
 	lines?: number;
 	timeoutSeconds?: number;
+	limit?: number;
+	offset?: number;
 };
 
 type JobMetadata = {
@@ -83,6 +109,12 @@ type SessionJobDetails = {
 	waitTimedOut?: boolean;
 	waitedMs?: number;
 	completionAcknowledged?: boolean;
+	totalJobs?: number;
+	listLimit?: number;
+	listOffset?: number;
+	nextOffset?: number;
+	listTruncation?: TruncationResult;
+	fullListOutputPath?: string;
 };
 
 type SessionJobTool = ToolDefinition<typeof SESSION_JOB_PARAMETERS, SessionJobDetails>;
@@ -187,7 +219,14 @@ async function listJobs(jobsDirectory: string): Promise<JobSnapshot[]> {
 			// Ignore incomplete directories left by a failed launch.
 		}
 	}
-	return jobs.sort((left, right) => right.createdAt.localeCompare(left.createdAt));
+	return jobs.sort((left, right) => {
+		const leftActive = !isTerminal(left);
+		const rightActive = !isTerminal(right);
+		if (leftActive !== rightActive) return leftActive ? -1 : 1;
+		const byCreatedAt = right.createdAt.localeCompare(left.createdAt);
+		if (byCreatedAt !== 0) return byCreatedAt;
+		return left.name < right.name ? -1 : left.name > right.name ? 1 : 0;
+	});
 }
 
 function shellPathConversion(variableName: string, nativeVariableName: string): string {
@@ -514,6 +553,115 @@ function formatJob(job: JobSnapshot): string {
 	return `${job.name}: ${job.status}${pid}${exitCode}\n  ${formatStarted(job.createdAt)}\n  cwd: ${job.cwd}\n  log: ${job.logPath}`;
 }
 
+function formatListSummary(totalJobs: number, offset: number, pageLength: number): string {
+	if (totalJobs === 0) return "No durable jobs in this session.";
+	if (pageLength === 0) return `No jobs at offset ${offset}. Total jobs: ${totalJobs}.`;
+	const first = offset + 1;
+	const last = offset + pageLength;
+	const next = last < totalJobs ? ` Next page: offset=${last}.` : "";
+	return `Showing jobs ${first}–${last} of ${totalJobs}.${next}`;
+}
+
+type JobListOutput = {
+	text: string;
+	truncation?: TruncationResult;
+	fullOutputPath?: string;
+};
+
+function displayListOutputPath(fullOutputPath: string): { text: string; truncated: boolean } {
+	const bounded = truncateHead(JSON.stringify(fullOutputPath), {
+		maxBytes: MAX_LIST_PATH_DISPLAY_BYTES,
+		maxLines: 1,
+	});
+	return {
+		text: bounded.truncated ? `${bounded.content}…` : bounded.content,
+		truncated: bounded.truncated,
+	};
+}
+
+function listTruncationNotice(truncation: TruncationResult, fullOutputPath: string): string {
+	const omittedLines = truncation.totalLines - truncation.outputLines;
+	const omittedBytes = truncation.totalBytes - truncation.outputBytes;
+	const displayedPath = displayListOutputPath(fullOutputPath);
+	const pathNote = displayedPath.truncated ? " (display truncated; exact path retained in tool result details)" : "";
+	return `[List page truncated: showing ${truncation.outputLines} of ${truncation.totalLines} lines (${formatSize(truncation.outputBytes)} of ${formatSize(truncation.totalBytes)}); ${omittedLines} lines (${formatSize(omittedBytes)}) omitted. Full page saved to: ${displayedPath.text}${pathNote}]`;
+}
+
+export function formatBoundedJobListText(fullText: string, fullOutputPath: string): JobListOutput {
+	const initial = truncateHead(fullText, {
+		maxBytes: DEFAULT_MAX_BYTES,
+		maxLines: DEFAULT_MAX_LINES,
+	});
+	if (!initial.truncated) return { text: fullText };
+
+	let truncation = initial;
+	for (let iteration = 0; iteration < 5; iteration += 1) {
+		const notice = listTruncationNotice(truncation, fullOutputPath);
+		const next = truncateHead(fullText, {
+			maxBytes: Math.max(1, DEFAULT_MAX_BYTES - Buffer.byteLength(`\n\n${notice}`)),
+			maxLines: Math.max(1, DEFAULT_MAX_LINES - 2),
+		});
+		if (next.outputBytes === truncation.outputBytes && next.outputLines === truncation.outputLines) break;
+		truncation = next;
+	}
+	const notice = listTruncationNotice(truncation, fullOutputPath);
+	const text = `${truncation.content.trimEnd()}\n\n${notice}`;
+	const safetyBound = truncateHead(text, { maxBytes: DEFAULT_MAX_BYTES, maxLines: DEFAULT_MAX_LINES });
+	if (safetyBound.truncated) {
+		return {
+			text: "[List page truncated. The full page path exceeded the display limit; its exact value is retained in tool result details.]",
+			truncation,
+			fullOutputPath,
+		};
+	}
+	return {
+		text: safetyBound.content,
+		truncation,
+		fullOutputPath,
+	};
+}
+
+async function cleanupExpiredJobListOutputs(temporaryRoot: string, now = Date.now()): Promise<void> {
+	let entries: Dirent[];
+	try {
+		entries = await fsp.readdir(temporaryRoot, { withFileTypes: true });
+	} catch {
+		return;
+	}
+	await Promise.all(
+		entries.map(async (entry) => {
+			if (!entry.isDirectory() || !entry.name.startsWith(JOB_LIST_TEMPORARY_PREFIX)) return;
+			const directory = path.join(temporaryRoot, entry.name);
+			try {
+				const stat = await fsp.stat(directory);
+				if (now - stat.mtimeMs > JOB_LIST_OUTPUT_TTL_MS) {
+					await fsp.rm(directory, { recursive: true, force: true });
+				}
+			} catch {
+				// Temporary-output cleanup is best-effort.
+			}
+		}),
+	);
+}
+
+export async function boundJobListOutput(fullText: string, temporaryRoot = os.tmpdir()): Promise<JobListOutput> {
+	const initial = truncateHead(fullText, {
+		maxBytes: DEFAULT_MAX_BYTES,
+		maxLines: DEFAULT_MAX_LINES,
+	});
+	if (!initial.truncated) return { text: fullText };
+
+	await cleanupExpiredJobListOutputs(temporaryRoot);
+	const temporaryDirectory = await fsp.mkdtemp(path.join(temporaryRoot, JOB_LIST_TEMPORARY_PREFIX));
+	await chmodPrivate(temporaryDirectory, 0o700);
+	const fullOutputPath = path.join(temporaryDirectory, "page.txt");
+	await withFileMutationQueue(fullOutputPath, async () => {
+		await fsp.writeFile(fullOutputPath, fullText, { encoding: "utf8", mode: 0o600 });
+	});
+	await chmodPrivate(fullOutputPath, 0o600);
+	return formatBoundedJobListText(fullText, fullOutputPath);
+}
+
 function formatAge(milliseconds: number): string {
 	if (!Number.isFinite(milliseconds) || milliseconds < 5_000) return "just now";
 	const seconds = Math.floor(milliseconds / 1_000);
@@ -565,6 +713,9 @@ function formatToolCall(params: Partial<SessionJobParams>): string {
 	if (params.name) parts.push(params.name);
 	if (params.action === "logs" && params.lines !== undefined) parts.push(`(${params.lines} lines)`);
 	if (params.action === "wait" && params.timeoutSeconds !== undefined) parts.push(`(${params.timeoutSeconds}s)`);
+	if (params.action === "list" && (params.limit !== undefined || params.offset !== undefined)) {
+		parts.push(`(limit ${params.limit ?? DEFAULT_JOB_LIST_LIMIT}, offset ${params.offset ?? 0})`);
+	}
 	return parts.join(" ");
 }
 
@@ -572,8 +723,7 @@ export function createSessionJobTool(callbacks: CallbackStream, agentDirectory: 
 	return defineTool({
 		name: "session_job",
 		label: "Session Job",
-		description:
-			"Start and manage durable background jobs that continue after Pi exits. Supports start, list, status, wait, logs, and stop. Job output is written to durable logs. Commands run through Bash and can report progress with pi-callback.",
+		description: `Start and manage durable background jobs that continue after Pi exits. Supports start, list, status, wait, logs, and stop. List returns ${DEFAULT_JOB_LIST_LIMIT} jobs by default and supports limit/offset pagination. Tool output is bounded to ${DEFAULT_MAX_LINES} lines or ${formatSize(DEFAULT_MAX_BYTES)}; an oversized list page is saved to a temporary file. Job output is written to durable logs. Commands run through Bash and can report progress with pi-callback.`,
 		promptSnippet: "Start and manage durable background jobs",
 		promptGuidelines: [
 			"Use session_job for long-running commands instead of backgrounding commands through bash.",
@@ -596,8 +746,26 @@ export function createSessionJobTool(callbacks: CallbackStream, agentDirectory: 
 			}
 			if (normalized.action === "list") {
 				const jobs = await listJobs(jobsDirectory);
-				const text = jobs.length === 0 ? "No durable jobs in this session." : jobs.map(formatJob).join("\n\n");
-				return { content: [{ type: "text", text }], details: { action: normalized.action, jobs } };
+				const limit = normalized.limit ?? DEFAULT_JOB_LIST_LIMIT;
+				const offset = normalized.offset ?? 0;
+				const page = jobs.slice(offset, offset + limit);
+				const summary = formatListSummary(jobs.length, offset, page.length);
+				const fullText = page.length === 0 ? summary : `${summary}\n\n${page.map(formatJob).join("\n\n")}`;
+				const output = await boundJobListOutput(fullText);
+				const nextOffset = offset + page.length < jobs.length ? offset + page.length : undefined;
+				return {
+					content: [{ type: "text", text: output.text }],
+					details: {
+						action: normalized.action,
+						jobs: page,
+						totalJobs: jobs.length,
+						listLimit: limit,
+						listOffset: offset,
+						nextOffset,
+						listTruncation: output.truncation,
+						fullListOutputPath: output.fullOutputPath,
+					},
+				};
 			}
 
 			const name = requireName(normalized.name);
@@ -710,16 +878,18 @@ export function createSessionJobTool(callbacks: CallbackStream, agentDirectory: 
 				return new Text(theme.fg("toolOutput", fallback), 0, 0);
 			}
 
-			const { action, job, jobs, logText, waitTimedOut, waitedMs } = result.details;
+			const { action, job, jobs, logText, waitTimedOut, waitedMs, totalJobs, listOffset, fullListOutputPath } =
+				result.details;
 			let text: string;
 			if (action === "list") {
-				if (!jobs || jobs.length === 0) {
-					text = "No durable jobs in this session.";
-				} else {
-					text = jobs
-						.map(options.expanded ? formatExpandedJob : formatCompactJob)
-						.join(options.expanded ? "\n\n" : "\n");
-				}
+				const page = jobs ?? [];
+				const summary = formatListSummary(totalJobs ?? page.length, listOffset ?? 0, page.length);
+				const formattedJobs = page
+					.map(options.expanded ? formatExpandedJob : formatCompactJob)
+					.join(options.expanded ? "\n\n" : "\n");
+				const fullPage =
+					options.expanded && fullListOutputPath ? `\n  full page: ${JSON.stringify(fullListOutputPath)}` : "";
+				text = formattedJobs ? `${summary}${fullPage}\n${formattedJobs}` : `${summary}${fullPage}`;
 			} else if (action === "logs" && job) {
 				text = options.expanded
 					? `${formatExpandedJob(job)}\n\n${logText ?? "(no output yet)"}`
@@ -749,7 +919,13 @@ export function createSessionJobTool(callbacks: CallbackStream, agentDirectory: 
 				text = fallback;
 			}
 
-			const boundedText = truncateTail(text, { maxBytes: DEFAULT_MAX_BYTES, maxLines: DEFAULT_MAX_LINES }).content;
+			const boundedText =
+				action === "list" && fullListOutputPath
+					? formatBoundedJobListText(text, fullListOutputPath).text
+					: (action === "list" ? truncateHead : truncateTail)(text, {
+							maxBytes: DEFAULT_MAX_BYTES,
+							maxLines: DEFAULT_MAX_LINES,
+						}).content;
 			return new Text(theme.fg("toolOutput", boundedText), 0, 0);
 		},
 	});

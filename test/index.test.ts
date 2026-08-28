@@ -1,9 +1,10 @@
 import { execFileSync } from "node:child_process";
-import { mkdtemp, readdir, readFile, rm, utimes, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rm, stat, utimes, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES } from "@earendil-works/pi-coding-agent";
+import { Check } from "typebox/value";
 import { afterEach, describe, expect, it } from "vitest";
 import {
 	buildCallbackBootstrap,
@@ -11,9 +12,22 @@ import {
 	jobCompletionFileName,
 	parseCallbackFileName,
 } from "../src/callbacks.js";
-import { createSessionJobTool, readLogTail, validateJobName } from "../src/jobs.js";
+import {
+	boundJobListOutput,
+	createSessionJobTool,
+	DEFAULT_JOB_LIST_LIMIT,
+	formatBoundedJobListText,
+	JOB_LIST_OUTPUT_TTL_MS,
+	MAX_JOB_LIST_LIMIT,
+	readLogTail,
+	validateJobName,
+} from "../src/jobs.js";
 
 const temporaryDirectories: string[] = [];
+
+function historyJobName(index: number): string {
+	return `history-${"x".repeat(60)}-${String(index).padStart(3, "0")}`;
+}
 
 const identityTheme = {
 	fg: (_name: string, text: string) => text,
@@ -81,6 +95,39 @@ function createCallbackStream(rescanIntervalMs = 25): {
 		},
 	} as unknown as Pick<ExtensionAPI, "appendEntry" | "sendMessage">;
 	return { callbacks: new CallbackStream(pi, { rescanIntervalMs }), entries, messages };
+}
+
+async function seedJob(
+	callbacks: CallbackStream,
+	options: {
+		name: string;
+		createdAt: string;
+		status?: "starting" | "running" | "succeeded" | "failed" | "stopped" | "interrupted";
+		cwd?: string;
+	},
+): Promise<void> {
+	const jobsDirectory = callbacks.jobsDirectory;
+	if (!jobsDirectory) throw new Error("callback stream is not initialized");
+	const jobDirectory = path.join(jobsDirectory, options.name);
+	await mkdir(jobDirectory, { mode: 0o700 });
+	const status = options.status ?? "succeeded";
+	await writeFile(
+		path.join(jobDirectory, "job.json"),
+		`${JSON.stringify({
+			name: options.name,
+			command: "true",
+			cwd: options.cwd ?? "/workspace",
+			createdAt: options.createdAt,
+			...(status === "running" ? { pid: process.pid } : {}),
+			...(status === "interrupted" ? { pid: 2_147_483_647 } : {}),
+		})}\n`,
+		"utf8",
+	);
+	await writeFile(path.join(jobDirectory, "job.log"), "", "utf8");
+	if (status === "succeeded" || status === "failed") {
+		await writeFile(path.join(jobDirectory, "exit-code"), status === "succeeded" ? "0\n" : "1\n", "utf8");
+	}
+	if (status === "stopped") await writeFile(path.join(jobDirectory, "stopped"), "stopped\n", "utf8");
 }
 
 afterEach(async () => {
@@ -196,6 +243,199 @@ describe("session_job", () => {
 		expect(validateJobName("tests-linux_1.0")).toBe(true);
 		expect(validateJobName("-bad")).toBe(false);
 		expect(validateJobName("has spaces")).toBe(false);
+	});
+
+	it("declares bounded list pagination parameters", () => {
+		const { callbacks } = createCallbackStream();
+		const tool = createSessionJobTool(callbacks, "/agent");
+		expect(Check(tool.parameters, { action: "list" })).toBe(true);
+		expect(Check(tool.parameters, { action: "list", limit: 1, offset: 0 })).toBe(true);
+		expect(Check(tool.parameters, { action: "list", limit: MAX_JOB_LIST_LIMIT, offset: 10_000 })).toBe(true);
+		expect(Check(tool.parameters, { action: "list", limit: 0 })).toBe(false);
+		expect(Check(tool.parameters, { action: "list", limit: MAX_JOB_LIST_LIMIT + 1 })).toBe(false);
+		expect(Check(tool.parameters, { action: "list", offset: -1 })).toBe(false);
+		expect(Check(tool.parameters, { action: "list", offset: 1.5 })).toBe(false);
+		expect(Check(tool.parameters, { action: "list", offset: Number.MAX_SAFE_INTEGER + 1 })).toBe(false);
+	});
+
+	it("lists active jobs first and paginates every retained job", async () => {
+		const agentDirectory = await createTemporaryDirectory();
+		const { callbacks } = createCallbackStream();
+		const context = createContext(agentDirectory);
+		await callbacks.start(agentDirectory, "list-pagination-session", context);
+		const tool = createSessionJobTool(callbacks, agentDirectory);
+		const baseTime = Date.now() - 60_000;
+		await Promise.all([
+			seedJob(callbacks, {
+				name: "active-newer",
+				createdAt: new Date(baseTime - 20_000).toISOString(),
+				status: "starting",
+			}),
+			seedJob(callbacks, {
+				name: "active-older",
+				createdAt: new Date(baseTime - 40_000).toISOString(),
+				status: "running",
+			}),
+			...Array.from({ length: 11 }, (_, index) =>
+				seedJob(callbacks, {
+					name: `terminal-${String(index).padStart(2, "0")}`,
+					createdAt: new Date(baseTime - index * 1_000).toISOString(),
+				}),
+			),
+		]);
+
+		const first = await tool.execute("list-default", { action: "list" }, undefined, undefined, context);
+		expect(first.details?.jobs).toHaveLength(DEFAULT_JOB_LIST_LIMIT);
+		expect(first.details?.totalJobs).toBe(13);
+		expect(first.details?.listLimit).toBe(DEFAULT_JOB_LIST_LIMIT);
+		expect(first.details?.listOffset).toBe(0);
+		expect(first.details?.nextOffset).toBe(DEFAULT_JOB_LIST_LIMIT);
+		expect(first.details?.jobs?.slice(0, 4).map((job) => job.name)).toEqual([
+			"active-newer",
+			"active-older",
+			"terminal-00",
+			"terminal-01",
+		]);
+		const firstText = first.content[0]?.type === "text" ? first.content[0].text : "";
+		expect(firstText).toContain("Showing jobs 1–10 of 13. Next page: offset=10.");
+
+		const second = await tool.execute(
+			"list-second",
+			{ action: "list", limit: 10, offset: 10 },
+			undefined,
+			undefined,
+			context,
+		);
+		expect(second.details?.jobs?.map((job) => job.name)).toEqual(["terminal-08", "terminal-09", "terminal-10"]);
+		expect(second.details?.nextOffset).toBeUndefined();
+		const secondText = second.content[0]?.type === "text" ? second.content[0].text : "";
+		expect(secondText).toContain("Showing jobs 11–13 of 13.");
+
+		const beyond = await tool.execute("list-beyond", { action: "list", offset: 100 }, undefined, undefined, context);
+		expect(beyond.details?.jobs).toEqual([]);
+		expect(beyond.content[0]).toEqual({ type: "text", text: "No jobs at offset 100. Total jobs: 13." });
+		callbacks.stop();
+	});
+
+	it("uses portable ASCII tie-breaking across terminal states", async () => {
+		const agentDirectory = await createTemporaryDirectory();
+		const { callbacks } = createCallbackStream();
+		const context = createContext(agentDirectory);
+		await callbacks.start(agentDirectory, "list-tie-session", context);
+		const tool = createSessionJobTool(callbacks, agentDirectory);
+		const tiedAt = new Date(Date.now() - 60_000).toISOString();
+		await Promise.all([
+			seedJob(callbacks, { name: "active", createdAt: tiedAt, status: "starting" }),
+			seedJob(callbacks, { name: "tie-0", createdAt: tiedAt, status: "stopped" }),
+			seedJob(callbacks, { name: "tie.0", createdAt: tiedAt, status: "interrupted" }),
+			seedJob(callbacks, { name: "tie_0", createdAt: tiedAt, status: "succeeded" }),
+		]);
+
+		const result = await tool.execute("list-ties", { action: "list" }, undefined, undefined, context);
+		expect(result.details?.jobs?.map((job) => `${job.name}:${job.status}`)).toEqual([
+			"active:starting",
+			"tie-0:stopped",
+			"tie.0:interrupted",
+			"tie_0:succeeded",
+		]);
+		callbacks.stop();
+	});
+
+	it("spills an oversized requested list page to a readable temporary file", async () => {
+		const agentDirectory = await createTemporaryDirectory();
+		const { callbacks } = createCallbackStream();
+		const context = createContext(agentDirectory);
+		await callbacks.start(agentDirectory, "list-overflow-session", context);
+		const tool = createSessionJobTool(callbacks, agentDirectory);
+		const baseTime = Date.now() - 60_000;
+		for (let start = 0; start < MAX_JOB_LIST_LIMIT; start += 100) {
+			await Promise.all(
+				Array.from({ length: 100 }, (_, relativeIndex) => {
+					const index = start + relativeIndex;
+					return seedJob(callbacks, {
+						name: historyJobName(index),
+						createdAt: new Date(baseTime - index * 1_000).toISOString(),
+						cwd: `/workspace/${"long-segment/".repeat(4)}${index}`,
+					});
+				}),
+			);
+		}
+
+		const result = await tool.execute(
+			"list-overflow",
+			{ action: "list", limit: MAX_JOB_LIST_LIMIT },
+			undefined,
+			undefined,
+			context,
+		);
+		const text = result.content[0]?.type === "text" ? result.content[0].text : "";
+		expect(result.details?.jobs).toHaveLength(MAX_JOB_LIST_LIMIT);
+		expect(result.details?.listTruncation?.truncated).toBe(true);
+		expect(text).toContain("[List page truncated:");
+		expect(Buffer.byteLength(text)).toBeLessThanOrEqual(DEFAULT_MAX_BYTES);
+		expect(text.split("\n").length).toBeLessThanOrEqual(DEFAULT_MAX_LINES);
+
+		const fullOutputPath = result.details?.fullListOutputPath;
+		expect(fullOutputPath).toBeDefined();
+		if (!fullOutputPath) throw new Error("list did not return its full output path");
+		temporaryDirectories.push(path.dirname(fullOutputPath));
+		const fullOutput = await readFile(fullOutputPath, "utf8");
+		expect(fullOutput).toContain(`${historyJobName(0)}: succeeded`);
+		expect(fullOutput).toContain(`${historyJobName(999)}: succeeded`);
+		expect(fullOutput).toContain("Showing jobs 1–1000 of 1000.");
+		expect(Buffer.byteLength(fullOutput)).toBeGreaterThan(Buffer.byteLength(text));
+		if (process.platform !== "win32") {
+			expect((await stat(fullOutputPath)).mode & 0o777).toBe(0o600);
+			expect((await stat(path.dirname(fullOutputPath))).mode & 0o777).toBe(0o700);
+		}
+
+		for (const expanded of [false, true]) {
+			const component = tool.renderResult?.(
+				result,
+				{ expanded, isPartial: false },
+				identityTheme as never,
+				{ cwd: agentDirectory, toolCallId: `list-overflow-${expanded}`, args: { action: "list" } } as never,
+			);
+			const rendered =
+				component
+					?.render(1_000_000)
+					.map((line) => line.trimEnd())
+					.join("\n") ?? "";
+			expect(Buffer.byteLength(rendered)).toBeLessThanOrEqual(DEFAULT_MAX_BYTES);
+			expect(rendered.split("\n").length).toBeLessThanOrEqual(DEFAULT_MAX_LINES);
+			expect(rendered).toContain("[List page truncated:");
+			expect(rendered).toContain(JSON.stringify(fullOutputPath));
+		}
+		callbacks.stop();
+	});
+
+	it("bounds escaped overflow paths and removes stale temporary pages", async () => {
+		const fullText = Array.from({ length: 3_000 }, (_, index) => `job ${index} ${"x".repeat(40)}`).join("\n");
+		const escapedPath = "/tmp/unusual\npage.txt";
+		const escaped = formatBoundedJobListText(fullText, escapedPath);
+		expect(escaped.text).toContain("\\npage.txt");
+		expect(escaped.text).not.toContain("\npage.txt");
+
+		const unusualPath = `${"/very-long".repeat(6_000)}\npage.txt`;
+		const formatted = formatBoundedJobListText(fullText, unusualPath);
+		expect(Buffer.byteLength(formatted.text)).toBeLessThanOrEqual(DEFAULT_MAX_BYTES);
+		expect(formatted.text.split("\n").length).toBeLessThanOrEqual(DEFAULT_MAX_LINES);
+		expect(formatted.text).toContain("display truncated; exact path retained in tool result details");
+		expect(formatted.text).toContain("[List page truncated:");
+		expect(formatted.fullOutputPath).toBe(unusualPath);
+
+		const temporaryRoot = await createTemporaryDirectory();
+		const staleDirectory = path.join(temporaryRoot, "pi-session-job-list-stale");
+		await mkdir(staleDirectory);
+		await writeFile(path.join(staleDirectory, "page.txt"), "stale", "utf8");
+		const staleTime = new Date(Date.now() - JOB_LIST_OUTPUT_TTL_MS - 1_000);
+		await utimes(staleDirectory, staleTime, staleTime);
+
+		const output = await boundJobListOutput(fullText, temporaryRoot);
+		expect(output.fullOutputPath).toBeDefined();
+		expect(await readdir(temporaryRoot)).not.toContain("pi-session-job-list-stale");
+		if (!output.fullOutputPath) throw new Error("overflow output path is missing");
+		expect(await readFile(output.fullOutputPath, "utf8")).toBe(fullText);
 	});
 
 	it("waits for success and acknowledges the automatic completion callback", async () => {
